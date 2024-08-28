@@ -1,0 +1,17 @@
+####################################
+##          PERMS FILE            ##
+## element user group permissions ##
+####################################
+
+
+CounterStatisticsToolInstructions.pdf root root 755
+
+counter_statistics_tool.bsh root root 755
+counter_statistics.bsh root root 755
+counter_tool_master_cron.bsh root root 755
+parsing_levels.py root root 755
+create_aggregation_count_history.sql root root 755
+
+version root root 755
+version/pkginfo root root 444
+

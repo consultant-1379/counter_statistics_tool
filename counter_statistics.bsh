@@ -1,0 +1,1748 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : counter_statistics.bsh
+# Date    : 8/12/2020
+# Revision: main\03
+# Purpose : To get the statistics of counter information
+# Usage   : counter_statistics.bsh -d  <FROM_DATE> -t <TO_DATE> -p <TECHPACK>
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+COLUMN=/usr/bin/column
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MYHOSTNAME=/usr/bin/hostname
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+NL=/usr/bin/nl
+PERL=/usr/bin/perl
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+SSH=/usr/bin/ssh
+SYSTEMCTL=/usr/bin/systemctl
+TAR=/usr/bin/tar
+TR=/usr/bin/tr
+XARGS=/usr/bin/xargs
+WC=/usr/bin/wc
+    
+    
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Name of the ini Files
+SUNOS_INI=SunOS.ini
+ENIQ_INI=niq.ini
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+
+}
+
+
+
+### Function: check_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+}
+
+
+
+### Function: check_id ###
+#
+#   Check that the effective id of the user is correct
+#   If not print error msg and exit.
+#
+# Arguments:
+#       $1 : User ID name
+# Return Values:
+#       none
+check_id()
+{
+_check_id_=`$ID  | $AWK -F\( '{print $2}' | $AWK -F\) '{print $1}'`
+if [ "$_check_id_" != "$1" ]; then
+    _err_msg_="You must be $1 to execute this script."
+    abort_script "$_err_msg_"
+fi
+}
+
+
+
+### Function: check_server_running ###
+#
+# Checks to see if the required server is running (dwhdb, repdb)
+#
+# Arguments:
+#
+# Return Values:
+#       none
+check_server_running()
+{
+SERVER_STATUS=1
+if [ "${1}" == "repdb" ]
+then
+    port=${REP_PORT}
+else
+    port=${DWH_PORT}
+fi
+
+# Check if server is up
+${IQDIR}/bin64/dbping -q -c "con=${1};eng=${1};links=tcpip{host=${1};port=${port};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}"  2>>${LOGFILE} 1>/dev/null
+if [ $? -ne 0 ] ; then
+    SERVER_STATUS=0
+    log_msg -t -s "ERROR:$1 is not running, aborting." -l ${LOGFILE}
+    #exit 1 
+fi
+}
+
+
+
+### Function: get_master_list_from_repdb ###
+#
+# Get master list from repdb
+#
+# Arguments: none
+#
+# Return Values: none
+get_master_list_from_repdb()
+{
+# create master file.. CO and RD handling
+$RM -rf ${VAR_TEMP}/DC_DIM_table_counter_info.txt
+dbisql ${CONN_STR_USER_DBA_REPDB} "select TYPEID, DATANAME from dwhrep.MeasurementCounter; output to ${VAR_TEMP}/DC_DIM_table_counter_info.txt APPEND HEXADECIMAL ASIS FORMAT TEXT DELIMITED BY ' ' QUOTE '' ;" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not fetch counter info for all tables from repdb.\n"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${VAR_TEMP}/DC_DIM_table_counter_info.txt | $AWK -F ":" '{print $NF}'| $SED 's/ /::/g' > ${TEM_DIR}/master_file_temp_1.txt
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not segregate table and counter from ${VAR_TEMP}/DC_DIM_table_counter_info.txt\n"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${TEM_DIR}/master_file_temp_1.txt | $GREP -iv "DIM_\|DC_Z_ALARM\|DC_E_BULK_CM\|LOG_" >> ${MASTER_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${MASTER_FILE} file\n"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: get_master_file_with_features ###
+#
+# map master file with features
+#
+# Arguments: none
+#
+# Return Values: none
+get_master_file_with_features()
+{
+$RM -rf ${WORK_DIR}/master_list_with_feature.txt
+#$CAT ${MASTER_FILE_USR_DISP}  | awk -F "::" '{print $1}' | $SORT -u > ${TEM_DIR}/master_distinct_tables.txt
+for tp_name in `$CAT ${WORK_DIR}/Techpacks.txt`;do
+    $GREP "^${tp_name}_" ${MASTER_FILE_USR_DISP}  > ${TEM_DIR}/table_based_on_tp.txt
+    if [ $? -eq 0  ];then
+        $RM -rf ${TEM_DIR}/feature.txt
+        $CAT ${WORK_DIR}/Interface_and_Techpacks.txt | $GREP -w ${tp_name} | $AWK -F " " '{print $1}' > ${TEM_DIR}/interfaces
+        
+        #get cxc list from interfaces
+        $GREP -iwf ${TEM_DIR}/interfaces /eniq/sw/conf/feature_techpacks | $AWK -F : '{print $1}' |$SORT -u > ${TEM_DIR}/cxc_number.txt
+        
+        # get feature name from cxc
+        $GREP -iwf ${TEM_DIR}/cxc_number.txt /eniq/sw/conf/feature_descriptions | $AWK -F :: '{print $2}' | $SORT -u > ${TEM_DIR}/feature_list
+        
+        #append feature information with the file
+        feature=`$CAT ${TEM_DIR}/feature_list | $TR '\n' "|" | $SED 's/.$//' `
+        if [ ! -z "${feature}" ];then
+			while read table_details;do
+                    $ECHO $table_details::$feature >> ${WORK_DIR}/master_list_with_feature.txt
+            done < ${TEM_DIR}/table_based_on_tp.txt
+        fi
+    fi
+
+done
+
+
+
+}
+
+
+
+### Function: check_params ###
+#
+# Check Input Parameters
+#
+# Arguments: none
+#
+# Return Values: none
+check_params()
+{
+
+
+if [[ ! "${FROM_DATE}" ]] && [[ "${TO_DATE}" ]]; then
+      usage_msg
+      $ECHO "\nERROR: Start Date needs to be passed along with End Date"
+      exit 1
+fi
+
+
+if [[ ! "${FROM_DATE}" &&  ! "${TO_DATE}" ]] && [[  "${TECHPACK}" ]]; then
+      usage_msg
+      $ECHO "\nERROR: Date needs to be passed along with ${TECHPACK}"
+      exit 1
+fi
+
+              
+# Date format check
+if [ "${FROM_DATE}" ]; then
+    if [ "${FROM_DATE}" != "1_day" -a "${FROM_DATE}" != "7_days" -a "${FROM_DATE}" != "30_days" -a "${FROM_DATE}" != "90_days" -a "${FROM_DATE}" != "180_days" -a "${FROM_DATE}" != "1_year" -a "${FROM_DATE}" != "default" ]; then
+    $ECHO "${FROM_DATE}" | $GREP -q '^[0-9]\{4\}-[0-1][0-9]-[0-3][0-9]$' > /dev/null 2>&1 
+    format=$?
+    date "+%Y-%m-%d" -d "${FROM_DATE}" > /dev/null  2>&1
+    is_valid=$?
+    if [ ${is_valid} -ne 0 -o ${format} -ne 0 ];then
+          $ECHO "\nERROR: Not valid time level(1_day/7_days/30_days/90_days/180_days/1_year/default) or Date format not correct. It should be yyyy-mm-dd format."
+          exit 1
+    fi
+	fi
+fi
+
+if [ "${TO_DATE}" ]; then
+        $ECHO "${TO_DATE}" | $GREP -q '^[0-9]\{4\}-[0-1][0-9]-[0-3][0-9]$' > /dev/null 2>&1 
+        format=$?
+        date "+%Y-%m-%d" -d "${TO_DATE}" > /dev/null  2>&1
+        is_valid=$?
+        if [ ${is_valid} -ne 0 -o ${format} -ne 0 ];then
+              $ECHO "\nERROR: Date format not correct. It should be yyyy-mm-dd format."
+              exit 1
+        fi
+fi
+}
+
+
+
+### Function: combine_reports ###
+#
+# combine used and unused information in a single file
+#
+# Arguments: none
+#
+# Return Values: none
+combine_reports()
+{
+
+if [ ! -f "${WORK_DIR}/master_list_with_feature.txt" ];then
+    get_master_file_with_features
+fi
+
+$ECHO "Still fetching Statistics.Please wait..."
+
+
+#get feature name tagged for aggregated file
+get_feature_name_from_tn ${TEM_DIR}/aggregated_used_counters.txt 
+$CP -p ${TEM_DIR}/overall_used_with_feature.txt ${TEM_DIR}/distinct_key_aggregated_counters.txt
+
+# get feature name tagged for daywise dump file
+get_feature_name_from_tn ${TEM_DIR}/used_counters.txt
+$CP -p ${TEM_DIR}/overall_used_with_feature.txt ${TEM_DIR}/counter_data_per_date.txt 				  
+
+#unused mapping with master list to get feature -removed partitions
+$AWK -F'_[0-9]*(:: *|$)' -vOFS='::' '{print $1,$2,$3,$4}'  ${TEM_DIR}/aggregated_used_counters.txt   > ${TEM_DIR}/used_tables_with_removed_partitions.txt
+
+#removed extensions
+$CAT ${TEM_DIR}/used_tables_with_removed_partitions.txt | $AWK -F :: '{print $1}'|  $AWK -F "_" 'NF{NF-=1}1'  OFS="_"  | $SED 's/$/::/g'| $SORT -u  > ${TEM_DIR}/used_tables_with_removed_extensions.txt
+   
+#unused+cntr+feature
+$AWK -F "::" 'FNR == NR { h[$1]; next }; !( $1 in h)'  ${TEM_DIR}/used_tables_with_removed_extensions.txt ${WORK_DIR}/master_list_with_feature.txt > ${TEM_DIR}/unused_counter_feature_from_master_file.txt
+
+#unused with 0 and NA 
+$AWK -F :: '$0=$1("::")$2("::0::NA::")$3' ${TEM_DIR}/unused_counter_feature_from_master_file.txt | grep -v "::::" >  ${TEM_DIR}/unused_counters.txt
+
+#combine used and unused aggregated with features
+$CAT ${TEM_DIR}/unused_counters.txt >> ${TEM_DIR}/distinct_key_aggregated_counters.txt
+
+}
+
+
+### Function: default_reports ###
+#
+# default reports
+#
+# Arguments: none
+#
+# Return Values: none
+default_reports()
+{
+
+$LS -larth  ${COUNTER_TOOL_STATISTICS_FILES_DIR} | $GREP default | $GREP ${_date_today_} > ${TEM_DIR}/default_reports
+if [ ! -s  "${TEM_DIR}/default_reports" ];then
+	$LS -larth  ${COUNTER_TOOL_STATISTICS_FILES_DIR} | $GREP default | $GREP ${yesterday}  > ${TEM_DIR}/default_reports
+	if [ -s  "${TEM_DIR}/default_reports" ];then
+		default_summary_of_reports
+	fi
+else
+	default_summary_of_reports
+fi 
+
+
+}
+
+
+### Function: default_summary_of_reports ###
+#
+# default reports
+#
+# Arguments: none
+#
+# Return Values: none
+default_summary_of_reports()
+{
+
+default_aggregated_counters_csv=`$CAT ${TEM_DIR}/default_reports | $GREP aggregated_counters | $AWK -F " " '{print $NF}'`
+default_aggregated_counters_csv=${COUNTER_TOOL_STATISTICS_FILES_DIR}/${default_aggregated_counters_csv}
+default_daywise_counters_csv=`$CAT ${TEM_DIR}/default_reports | $GREP counter_data_per_date | $AWK -F " " '{print $NF}'`
+default_daywise_counters_csv=${COUNTER_TOOL_STATISTICS_FILES_DIR}/${default_daywise_counters_csv}
+
+default_unused_counters_csv=`$CAT ${TEM_DIR}/default_reports | $GREP unused_counter_list | $AWK -F " " '{print $NF}'`
+default_unused_counters_csv=${COUNTER_TOOL_STATISTICS_FILES_DIR}/${default_unused_counters_csv}
+
+$CAT ${default_aggregated_counters_csv} |  $SED 's/,/::/g'  | $GREP -v '#' > ${TEM_DIR}/distinct_key_aggregated_counters.txt
+$CAT ${default_daywise_counters_csv} |  $SED 's/,/::/g' | $GREP -v '#' > ${TEM_DIR}/counter_data_per_date.txt
+$CAT ${default_unused_counters_csv} |  $SED 's/,/::/g' | $GREP -v '#' > ${TEM_DIR}/unused_counters.txt
+ 
+unused_counter_list=${TEM_DIR}/unused_counters.txt
+aggregated_counters=${TEM_DIR}/distinct_key_aggregated_counters.txt 
+counter_data_per_date=${TEM_DIR}/counter_data_per_date.txt 
+
+display_python_summary
+$RM -rf ${TEM_DIR}
+exit 0
+}
+
+
+
+### Function: display_python_summary ###
+#
+#   display summary 
+#table and csv files
+# Arguments:
+#   none
+# Return Values:
+#   none
+display_python_summary()
+{
+
+    $ECHO -e "\n"
+    $ECHO -en "\033[32m"
+    log_msg  -s "\n\n==============================================================================================================================" -l $LOGFILE
+    log_msg  -s "                                          COUNTER RECOMMENDATION SUMMARY : $HNAME($CURR_SERVER_TYPE)                  " -l $LOGFILE
+    log_msg  -s "==============================================================================================================================\n" -l $LOGFILE
+    
+    $ECHO -en "\033[0m"
+
+    $ECHO -en "\033[1m"
+    if [ "${TECHPACK}" ];then
+        if [ -f "${TECHPACK}" ];then
+            $ECHO "FEATURE SELECTED:\n";$NL ${TEM_DIR}/feature_selected.txt; $ECHO -e "\n" | $TEE $LOGFILE
+        else
+            log_msg -l ${LOGFILE} -t -s  "FEATURE SELECTED: ${TECHPACK}"
+        fi
+    else
+        log_msg -l ${LOGFILE} -t -s "FEATURE SELECTED: Default - All features in the database would be taken into consideration" 
+    fi
+    if [ ! "${TO_DATE}" ];then
+        #check if date format print date otehrwise .. add dates here 
+        if [ "${FROM_DATE}" == "1_day" ]; then
+            start_date=`date --date="1 day ago" +%Y-%m-%d`
+            end_date=`date +%Y-%m-%d`
+        log_msg -l ${LOGFILE} -t -s "INPUT DATE RANGE PROVIDED - Start Date : ${start_date}    End Date: ${end_date}"
+        elif [ "${FROM_DATE}" == "7_days" ]; then
+            start_date=`date --date="7 day ago" +%Y-%m-%d`
+            end_date=`date +%Y-%m-%d`
+        log_msg -l ${LOGFILE} -t -s "INPUT DATE RANGE PROVIDED - Start Date : ${start_date}    End Date: ${end_date}"
+        elif [ "${FROM_DATE}" == "30_days" ]; then
+            start_date=`date --date="30 day ago" +%Y-%m-%d`
+            end_date=`date +%Y-%m-%d`
+        log_msg -l ${LOGFILE} -t -s "INPUT DATE RANGE PROVIDED - Start Date : ${start_date}    End Date: ${end_date}"
+        elif [ "${FROM_DATE}" == "90_days" ]; then
+            start_date=`date --date="90 day ago" +%Y-%m-%d`
+            end_date=`date +%Y-%m-%d`
+        log_msg -l ${LOGFILE} -t -s "INPUT DATE RANGE PROVIDED - Start Date : ${start_date}    End Date: ${end_date}"
+        elif [ "${FROM_DATE}" == "180_days" ]; then
+            start_date=`date --date="180 day ago" +%Y-%m-%d`
+            end_date=`date +%Y-%m-%d`
+        log_msg -l ${LOGFILE} -t -s "INPUT DATE RANGE PROVIDED - Start Date : ${start_date}    End Date: ${end_date}"
+        elif [ "${FROM_DATE}" == "1_year" ]; then
+            start_date=`date --date="1 year ago" +%Y-%m-%d`
+            end_date=`date +%Y-%m-%d`
+        log_msg -l ${LOGFILE} -t -s "INPUT DATE RANGE PROVIDED - Start Date : ${start_date}    End Date: ${end_date}"
+        elif [ "${FROM_DATE}" == "default" ]; then
+            log_msg -l ${LOGFILE} -t -s "INPUT DATE RANGE PROVIDED - Default - All data in the database."
+        fi
+    else
+        log_msg -l ${LOGFILE} -t -s "INPUT DATE RANGE PROVIDED - Start Date : ${FROM_DATE}    End Date: ${TO_DATE}"
+    fi
+
+    #calling the python script
+    python ${SCRIPTHOME}/parsing_levels.py "${aggregated_counters}" "${LOGFILE}" "user_display" "${counter_data_per_date}" "${unused_counter_list}" 
+    if [ $? -ne 0 ]; then
+        $ECHO -en "\033[0m"
+        $RM -rf ${MASTER_FILE_USR_DISP}
+        _err_msg_="\nCould not generate Reports.\n"
+        abort_script "$_err_msg_"
+    fi
+    $ECHO -en "\033[0m"
+
+}
+
+
+### Function: get_eniq_counter_tool_feature_list ###
+#
+# get feature list
+#
+# Arguments: none
+#
+# Return Values: none
+get_eniq_counter_tool_feature_list()
+{
+
+# Get directory where the ENIQ Features are stored on DVD/Jumpstart
+_eniq_feat_input_dir_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_Dir`
+if [ ! "${_eniq_feat_input_dir_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_Dir from ${CLI_CONF_DIR}/${ENIQ_INI} file"
+    abort_script "$_err_msg_"
+fi
+
+# Get file where the ENIQ Features are listed on DVD/Jumpstart
+_tem_feat_input_file_=`iniget FEATURE_INFO -f ${CLI_CONF_DIR}/${ENIQ_INI} -v Feature_Input_File`
+if [ ! "${_tem_feat_input_file_}" ]; then
+    _err_msg_="Could not read parameter Feature_Input_File from${CLI_CONF_DIR}/${ENIQ_INI} file"
+    abort_script "$_err_msg_"
+fi
+##  if script is run for feature only upgrade, SW_DIR is taken from manage features script, otherwise from upgrade eniq sw script.
+if [ -z "${FEATURE_SW_DIR}" ]
+then
+    SW_DIR=${BASE_SW_DIR}
+else
+    SW_DIR=${FEATURE_SW_DIR}
+fi
+# Does the feature input file exist?
+
+    _eniq_feat_input_file_="$SW_DIR/${_eniq_feat_input_dir_}/${_tem_feat_input_file_}"
+
+
+if [ ! -s ${_eniq_feat_input_file_} ]; then
+     if [ $INSTALL_TYPE == "stats" ]; then
+        $ECHO "Could not locate ENIQ Features input file - ${_eniq_feat_input_file_}"
+        return 99
+    else
+        _err_msg_="Could not locate ENIQ Features input file - ${_eniq_feat_input_file_}"
+        abort_script "$_err_msg_"
+    fi
+fi
+
+# Get Directory where the list of managed features will be stored
+_feature_list_dir_=`iniget FEATURE_INFO -f ${ENIQ_CONF_DIR}/${ENIQ_INI} -v Feature_Interface_Dir`
+if [ ! "${_feature_list_dir_}" ]; then
+    _err_msg_="Failed to read Parameter Feature_Interface_Dir from ${ENIQ_CONF_DIR}/${ENIQ_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Total Interface File
+_eniq_total_feature_output_file_=${_feature_list_dir_}/total_feature_install_list
+if [ ! -s ${_eniq_total_feature_output_file_} ]; then
+    _err_msg_="Could not locate installed list of features - ${_eniq_total_feature_output_file_}"
+    abort_script "$_err_msg_"
+fi
+
+# Does the sentinel environment file exist?
+if [ ! -s ${ENIQ_SENTINEL_ENV} ]; then
+    _err_msg_="${ENIQ_SENTINEL_ENV} not found or empty"
+    abort_script "$_err_msg_"
+fi
+
+# Source the env file
+. ${ENIQ_SENTINEL_ENV}
+if [ $? -ne 0 ]; then
+    _err_msg_="Error sourcing environment file ${ENIQ_SENTINEL_ENV}"
+    abort_script "$_err_msg_"
+fi
+
+# Does the sentinel lsmon binary exist?
+if [ ! -x ${ENIQ_SENTINEL_BIN_DIR}/lsmon ]; then
+    _err_msg_="${ENIQ_SENTINEL_BIN_DIR}/lsmon not found or not executable"
+    abort_script "$_err_msg_"
+fi
+
+# Get a list of licensed features
+get_licenced_features ${LOGFILE} ${TEM_DIR} ${ENIQ_SENTINEL_BIN_DIR}/lsmon ${LSHOST}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not generate a list of licenses on ${LSHOST}"
+    abort_script "$_err_msg_"
+fi
+
+_working_list_=${TEM_DIR}/feature_work_list
+_working_list_1=${TEM_DIR}/feature_work_list1
+_build_list_=0
+
+$RM -f ${_working_list_} ${_working_list_1}
+# Was I supplied Feature(s) in a file for a specific OSS to be upgraded
+if [ "${ENIQ_FEATURE_FILE}" ]; then
+    if [ ! -s ${ENIQ_FEATURE_FILE} ]; then
+    _err_msg_="Interface list file ${ENIQ_FEATURE_FILE} missing or empty"
+    abort_script "$_err_msg_"
+    fi
+    $CP ${ENIQ_FEATURE_FILE} ${_working_list_}
+        if [ $? -ne 0 ]; then
+            _err_msg_="Could not copy ${ENIQ_FEATURE_FILE}\nto ${_working_list_}"
+            abort_script "$_err_msg_" 
+        fi
+    
+# Was I supplied Feature(s) to be updated
+elif [ "${ENIQ_FEATURE}" ]; then
+    if [ "${ENIQ_FEATURE}" == "ALL" ]; then
+    $CAT ${_eniq_total_feature_output_file_} | $AWK -F"::" '{print $1"::"$2}' >> ${_working_list_1}
+    else
+    _tem_list_=`$ECHO ${ENIQ_FEATURE} | $SED -e 's|,| |g'`
+    for _feat_ in ${_tem_list_}; do
+        _chk_feat_inst_=`$CAT ${_eniq_total_feature_output_file_} | $GREP -w ${_feat_} | $HEAD -1`
+        if [ $? -ne 0 ]; then
+        _err_msg_="Feature ${_feat_} cannot be updated as it has not been installed"
+        abort_script "$_err_msg_"
+        fi
+        $ECHO "${_chk_feat_inst_} | $AWK -F"::" '{print $1"::"$2}" >>  ${_working_list_1}
+    done
+    fi
+else
+    $CAT ${_eniq_total_feature_output_file_} | $AWK -F"::" '{print $1"::"$2}' >> ${_working_list_1}
+    _build_list_=1
+fi
+
+# We need to put the list in order now and remove the duplicates.
+while read _feat_detail_; do
+    _feat_=`$ECHO ${_feat_detail_} | $AWK -F"::" '{print $1}'`
+    $CAT ${_working_list_1} | $SORT -u | $EGREP "^${_feat_}::" >> ${_working_list_} 2>/dev/null
+done < ${_eniq_feat_input_file_}
+
+
+
+unset FEATURE_ARRAY START_DATE_ARRAY END_DATE_ARRAY
+# Build 3 arrays of all the ENIQ Features. One array for the description
+# and the 2nd array for the file designation
+_cnt_=${#_tem_feature_array_[@]}
+_ptr_=0
+
+for (( i=0; i<=${_cnt_}; i++)); do
+    _desc_=`$CAT ${_working_list_} | $EGREP "^[ ]*${_tem_feature_array_[${i}]}::" | $AWK -F"::" '{print $2}'`
+    if [ "${_desc_}" ]; then
+        let _ptr_=${_ptr_}+1
+        FEATURE_ARRAY[${_ptr_}]=${_tem_feature_array_[${i}]}
+        START_DATE_ARRAY[${_ptr_}]=${_tem_start_date_array_[${i}]}
+        END_DATE_ARRAY[${_ptr_}]=${_tem_end_date_array_[${i}]}
+        DESC_ARRAY[${_ptr_}]=${_desc_}
+        
+        if [ ! "${FEATURE_ARRAY[${_ptr_}]}" -o ! "${START_DATE_ARRAY[${_ptr_}]}" -o ! "${END_DATE_ARRAY[${_ptr_}]}" -o ! "${DESC_ARRAY[${_ptr_}]}" ]; then
+            _err_msg_="Malformed license value"
+            abort_script "$_err_msg_"
+        fi
+    fi
+done
+
+if [ ${#START_DATE_ARRAY[@]} -eq 0 ]; then
+    $ECHO "No valid ENIQ licenses read from License Server ${LSHOST}"
+    $ECHO "only Standard TPs and PF installation will continue."
+    return 99
+fi
+
+# Get todays date
+_now_date_=`$DATE '+%Y%m%d'`
+
+# Create the Display file
+_disp_file_=${TEM_DIR}/disp_file
+_unlic_file_=${TEM_DIR}/unlicensed_file
+$RM -f ${_disp_file_} ${_unlic_file_}
+
+$ECHO "Currently installed and licensed ENIQ features" >> ${_disp_file_}
+$ECHO "==============================================" >> ${_disp_file_}
+
+_cnt_=${#FEATURE_ARRAY[@]}
+_menu_opt_=0
+for (( i=1; i<=${_cnt_}; i++)); do
+    if [ ${START_DATE_ARRAY[${i}]} -gt ${_now_date_} -o ${END_DATE_ARRAY[${i}]} -lt ${_now_date_} ]; then
+        $ECHO "[N/A]  ${DESC_ARRAY[${i}]}  (E)" >> ${_unlic_file_}
+    else
+        let _menu_opt_=_menu_opt_+1
+        VALID_FEATURE_ARRAY[${_menu_opt_}]=${FEATURE_ARRAY[${i}]}
+        VALID_DESC_ARRAY[${_menu_opt_}]=${DESC_ARRAY[${i}]}
+        
+        _oss_list_=`$CAT ${_eniq_total_feature_output_file_} \
+                           | $EGREP "^[[:blank:]]*${VALID_FEATURE_ARRAY[${_menu_opt_}]}::"\
+                           | $AWK -F"::" '{print $3}'`
+        if [ "${_oss_list_}" ]; then
+            _oss_list_=`$ECHO ${_oss_list_}|$SED -e 's| |,|g'`
+            _oss_list_array_[${_menu_opt_}]="${_oss_list_}"
+        fi
+        
+        if [ "${_oss_list_array_[${_menu_opt_}]}" == "" ]; then
+            $ECHO "[${_menu_opt_}]  ${DESC_ARRAY[${i}]}" >> ${_disp_file_}
+            else
+            $ECHO "[${_menu_opt_}]  ${DESC_ARRAY[${i}]}  (${_oss_list_array_[${_menu_opt_}]})" >> ${_disp_file_}
+            
+        fi
+        
+    fi
+done
+
+
+
+$ECHO "\nSelect one ENIQ Feature based on which \nyou wish to filter the Statistics using the following format [n or All]" >> ${_disp_file_}
+$ECHO "\tE.G. 1,2,..10" >> ${_disp_file_}
+
+if [ ${_build_list_} -eq 0 ]; then
+    # Number of options
+    _cnt_=${#VALID_FEATURE_ARRAY[@]}
+
+    $RM -f ${TEM_DIR}/feature_output_list1 ${TEM_DIR}/feature_output_list2 ${TEM_DIR}/feature_selection
+    
+    # Create the Display file
+    for (( i=1; i<=${_cnt_}; i++)); do
+        $ECHO "${i}" >>  ${TEM_DIR}/feature_selection
+    done
+else 
+    while :; do
+        $CLEAR
+        $CAT ${_disp_file_}
+        $ECHO "\nSelect 'All' if you wish to consider all features installed on the server.\nIf skipped all installed features would be taken by default.\n"
+        read _opt_
+    
+        # If the User hit nothing
+        if [ ! "${_opt_}" ]; then
+            break
+        fi
+        
+        $RM -f ${TEM_DIR}/feature_output_list1 ${TEM_DIR}/feature_output_list2 ${TEM_DIR}/feature_selection
+        
+        if [ "${_opt_}" == "All" -o  "${_opt_}" == "all" ]; then
+            break
+        fi
+        
+        _numerror_=0
+        
+        for _num_ in `$ECHO ${_opt_} | $SED -e 's| ||g' -e 's|,| |g'`; do
+            $ECHO ${_num_} | $EGREP '-' >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                _start_=`$ECHO ${_num_} | $AWK -F\- '{print $1}'`
+                if [ ! "${_start_}" ]; then
+                    continue
+                fi
+                
+                _end_=`$ECHO ${_num_} | $AWK -F\- '{print $2}'`
+                for (( _sel_=${_start_}; _sel_<=${_end_}; _sel_++ )); do
+                    $ECHO ${_sel_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                    if [ $? -ne 0 ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    
+                    if [ ${_sel_} -lt 1 -o ${_sel_} -gt ${_cnt_} ]; then
+                        _numerror_=1
+                        break
+                    fi
+                    
+                    $ECHO ${_sel_} >> ${TEM_DIR}/feature_selection
+                done
+            else
+                $ECHO ${_num_} | $EGREP '^[0-9]+$' >> /dev/null 2>&1
+                if [ $? -ne 0 ]; then
+                    _numerror_=1
+                    break
+                fi
+                        
+                if [ ${_num_} -lt 1 -o ${_num_} -gt ${_cnt_} ]; then
+                    _numerror_=1
+                    break
+                fi
+                        
+                $ECHO ${_num_} >> ${TEM_DIR}/feature_selection
+            fi
+        done
+    
+        if [ ${_numerror_} -eq 0 ]; then
+            break
+        fi
+    done
+fi
+
+# Okay I should have a valid choice now in the ${TEM_DIR}/feature_selection
+# file, however it may need to be sorted and to remove duplicate numbers if
+# the user entered duplicate values. Output deails to output file. I will
+# output the desc as well as I might show the user
+if [ -s ${TEM_DIR}/feature_selection ]; then
+    for i in `$CAT ${TEM_DIR}/feature_selection | $SORT -u`; do
+        $ECHO "${VALID_FEATURE_ARRAY[${i}]}::${VALID_DESC_ARRAY[${i}]}::" >> ${TEM_DIR}/feature_output_list1
+
+        if [ "${_oss_list_array_[${i}]}" == "" ]; then
+            $ECHO "${VALID_DESC_ARRAY[${i}]}" >> ${TEM_DIR}/feature_output_list2
+            else
+            $ECHO "${VALID_DESC_ARRAY[${i}]} (${_oss_list_array_[${i}]})" >> ${TEM_DIR}/feature_output_list2
+        fi
+    done
+fi
+
+$RM -f ${TEM_DIR}/features_to_be_managed
+
+# We need to put the list in order now and remove the duplicates.
+if [ -s ${TEM_DIR}/feature_output_list1 ]; then
+    while read _feat_detail_; do
+        _feat_=`$ECHO ${_feat_detail_}| $AWK -F"::" '{print $1}'`
+        $CAT ${TEM_DIR}/feature_output_list1 | $SORT -u | $EGREP "^${_feat_}::" >> ${TEM_DIR}/features_to_be_managed 2>/dev/null
+    done < ${_eniq_feat_input_file_}
+fi
+
+}
+
+### Function: get_feature_list ###
+#
+# get feature list
+#
+# Arguments: none
+#
+# Return Values: none
+get_feature_list()
+{
+if [ -s /eniq/installation/config/eniq_feature_locate ];then
+    FEATURE_SW_DIR=`cat /eniq/installation/config/eniq_feature_locate`
+fi
+ENIQ_CORE_ETC_DIR=${ENIQ_CORE_INST_DIR}/etc
+ENIQ_SENTINEL_DIR=${ENIQ_BASE_DIR}/sentinel
+ENIQ_SENTINEL_BIN_DIR=${ENIQ_SENTINEL_DIR}/bin
+ENIQ_SENTINEL_ENV=${ENIQ_SENTINEL_DIR}/etc/sentinel.env
+get_eniq_counter_tool_feature_list
+
+if [ ! -s ${TEM_DIR}/features_to_be_managed ];then
+    log_msg -l ${LOGFILE} -t -s "Considering all features by default."
+else
+     $CAT ${TEM_DIR}/features_to_be_managed  | $AWK -F:: '{print $2}' > ${TEM_DIR}/feature_selected.txt
+     $CAT ${TEM_DIR}/features_to_be_managed | $AWK -F:: '{print $1}'> ${TEM_DIR}/cxp_numbers.txt
+     $GREP -iwf ${TEM_DIR}/cxp_numbers.txt /eniq/sw/conf/feature_techpacks | $AWK -F :: '{print $NF}' | $SORT -u > ${TEM_DIR}/interface_selected.txt
+
+    if [ ! -f "${WORK_DIR}/Interface_and_Techpacks.txt" ];then
+        get_intf_from_repdb
+    fi
+
+     $GREP -iwf ${TEM_DIR}/interface_selected.txt ${WORK_DIR}/Interface_and_Techpacks.txt | $AWK -F " " '{print $NF}' | $SORT -u > ${TEM_DIR}/techpacks_selected.txt
+     TECHPACK=${TEM_DIR}/techpacks_selected.txt
+fi
+
+
+}
+
+
+
+### Function: get_feature_name_from_tn ###
+#
+# get feature name from tn
+#
+# Arguments: none
+#
+# Return Values: none
+get_feature_name_from_tn()
+{
+$RM -rf ${TEM_DIR}/overall_used_with_feature.txt
+
+if [ ! -s "${WORK_DIR}/Techpacks.txt" ];then
+    get_tp_from_repdb
+fi
+
+if [ ! -s "${WORK_DIR}/Interface_and_Techpacks.txt" ];then
+    get_intf_from_repdb
+fi
+
+$ECHO "Mapping feature information for the counter statistics..."
+
+for tp_name in `$CAT ${WORK_DIR}/Techpacks.txt`;do
+    $GREP "^${tp_name}_" $1  > ${TEM_DIR}/used_based_on_tp.txt
+    if [ $? -eq 0  ];then
+        $RM -rf ${TEM_DIR}/feature.txt
+        $CAT ${WORK_DIR}/Interface_and_Techpacks.txt | $GREP -w ${tp_name} | $AWK -F " " '{print $1}' > ${TEM_DIR}/interfaces
+        
+        #get cxc list from interfaces
+        $GREP -iwf ${TEM_DIR}/interfaces /eniq/sw/conf/feature_techpacks | $AWK -F : '{print $1}' |$SORT -u > ${TEM_DIR}/cxc_number.txt
+        
+        # get feature name from cxc
+        $GREP -iwf ${TEM_DIR}/cxc_number.txt /eniq/sw/conf/feature_descriptions | $AWK -F :: '{print $2}' | $SORT -u > ${TEM_DIR}/feature_list
+        
+        #append feature information with the file
+        feature=`$CAT ${TEM_DIR}/feature_list | $TR '\n' "|" | $SED 's/.$//' `
+        if [ ! -z "${feature}" ];then
+             while read used;do
+                    $ECHO $used::$feature >> ${TEM_DIR}/overall_used_with_feature.txt
+            done < ${TEM_DIR}/used_based_on_tp.txt
+        fi
+    fi
+
+done
+
+$ECHO "Still fetching Statistics.Please wait..."
+
+}
+
+### Function: get_intf_from_repdb ###
+#
+# get interface and tp form repdb
+#
+# Arguments: none
+#
+# Return Values: none
+get_intf_from_repdb()
+{
+#create TP masterlist
+$RM -rf ${TEM_DIR}/intf_for_TP.txt
+dbisql ${CONN_STR_USER_DBA_REPDB} "select INTERFACENAME,TECHPACKNAME from dwhrep.InterfaceTechpacks; output to ${TEM_DIR}/intf_for_TP.txt  APPEND HEXADECIMAL ASIS FORMAT TEXT DELIMITED BY ' ' QUOTE '' ;" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Not able get Interface list.\n"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${TEM_DIR}/intf_for_TP.txt | $SORT -u > ${WORK_DIR}/Interface_and_Techpacks.txt
+
+}
+
+
+### Function: get_tp_from_repdb ###
+#
+# get tp name from tn
+#
+# Arguments: none
+#
+# Return Values: none
+get_tp_from_repdb()
+{
+
+#create TP masterlist
+$RM -rf ${TEM_DIR}/Techpacks.txt 
+dbisql ${CONN_STR_USER_DBA_REPDB} "select TECHPACKNAME from dwhrep.InterfaceTechpacks; output to ${TEM_DIR}/Techpacks.txt  APPEND HEXADECIMAL ASIS FORMAT TEXT DELIMITED BY ' ' QUOTE '' ;" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Not able get Techpack list.\n"
+    abort_script "$_err_msg_"
+fi
+
+$SORT -u ${TEM_DIR}/Techpacks.txt  > ${WORK_DIR}/Techpacks.txt
+
+}
+
+
+### Function: get_used_columns_from_database ###
+#
+# Get used columns from dwhdb
+#
+# Arguments: none
+#
+# Return Values: none
+get_used_columns_from_database()
+{
+
+    #table not present in DB
+    ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "SELECT count(*) FROM sysobjects  WHERE name = 'Aggregation_Count_History' ;" > ${TEM_DIR}/check_table 
+    if [ $? -ne 0 ];then
+        _err_msg_="Could not execute the query tocheck if table exists."
+        abort_script "${_err_msg_}"
+    fi
+    $CAT ${TEM_DIR}/check_table  | $GREP -w "0"  >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        log_msg -l ${LOGFILE} -t -s "Statistics Table is not created in Database.\nPlease let the tool collect statistics for minimum 1 day post enabling it."
+        exit 1 
+    fi
+     if [ "${FROM_DATE}" -a  ! "${TO_DATE}" ]; then
+            if [ "${FROM_DATE}" == "1_day" ]; then
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Statistics past 1 day."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select * from dba.Aggregation_Count_History where access_date between dateadd(day,-1,getdate()) and getdate() ; OUTPUT TO ${TEM_DIR}/used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT "  >> /dev/null 2>&1
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Aggregated Statistics past 1 day."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select db_object,counter_name,sum(counter_count),max(access_date)  from dba.Aggregation_Count_History  where access_date between  dateadd(day,-1,getdate()) group by db_object,counter_name; OUTPUT TO ${TEM_DIR}/aggregated_used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+
+            elif [ "${FROM_DATE}" == "7_days" ]; then
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Statistics past 7 days."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select * from dba.Aggregation_Count_History where access_date between dateadd(week,-1,getdate()) and getdate() ; OUTPUT TO ${TEM_DIR}/used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Aggregated Statistics past 7 days."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select db_object,counter_name,sum(counter_count),max(access_date)  from dba.Aggregation_Count_History  where access_date between dateadd(week,-1,getdate()) and getdate()  group by db_object,counter_name ; OUTPUT TO ${TEM_DIR}/aggregated_used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+ 
+
+            elif [ "${FROM_DATE}" == "30_days" ]; then
+				if [ ! ${COMPLETE_RUN} ];then
+					$LS -larth  ${COUNTER_TOOL_STATISTICS_FILES_DIR} | $GREP 30_days_ | $GREP ${_date_today_} > ${TEM_DIR}/default_reports
+					if [ ! -s ${TEM_DIR}/default_reports ];then
+						$LS -larth  ${COUNTER_TOOL_STATISTICS_FILES_DIR} | $GREP 30_days_ | $GREP ${yesterday}  > ${TEM_DIR}/default_reports
+						if [ ! -s ${TEM_DIR}/default_reports ];then
+							dateago=`stat ${COUNTER_TOOL_PARENT_DIR}/.rll_enabled_flag | grep 'Access: [[:digit:]]' | cut -d' ' -f2`
+							dtSec=$(date --date "$dateago" +'%s')
+							timeago='30 days ago'
+							taSec=$(date --date "$timeago" +'%s')
+							if [ $dtSec -gt $taSec ] ;then
+								#less than 30 days then check if default file presnt
+								log_msg -l ${LOGFILE} -t -q -s "Date from enabling the tool till today is less than 30 days. Hence taking the default files generated."
+								default_reports
+							fi
+						else
+							default_summary_of_reports
+						fi
+					else
+					default_summary_of_reports
+					fi
+				fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Statistics past 30 days."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select * from dba.Aggregation_Count_History where access_date between dateadd(day,-30,getdate()) and getdate() ; OUTPUT TO ${TEM_DIR}/used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database for past 30 days."
+                    abort_script "${_err_msg_}"
+                fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Aggregated Statistics past 30 days."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select db_object,counter_name,sum(counter_count),max(access_date)  from dba.Aggregation_Count_History  where access_date between dateadd(day,-30,getdate()) and getdate()  group by db_object,counter_name ; OUTPUT TO ${TEM_DIR}/aggregated_used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+
+            elif [ "${FROM_DATE}" == "90_days" ]; then
+				if [ ! ${COMPLETE_RUN} ];then
+					$LS -larth  ${COUNTER_TOOL_STATISTICS_FILES_DIR} | $GREP 90_days_ | $GREP ${_date_today_} > ${TEM_DIR}/default_reports
+					if [ ! -s ${TEM_DIR}/default_reports ];then
+						$LS -larth  ${COUNTER_TOOL_STATISTICS_FILES_DIR} | $GREP 90_days_ | $GREP ${yesterday}  > ${TEM_DIR}/default_reports
+						if [ ! -s ${TEM_DIR}/default_reports ];then
+							dateago=`stat ${COUNTER_TOOL_PARENT_DIR}/.rll_enabled_flag | grep 'Access: [[:digit:]]' | cut -d' ' -f2`
+							dtSec=$(date --date "$dateago" +'%s')
+							timeago='30 days ago'
+							taSec=$(date --date "$timeago" +'%s')
+							if [ $dtSec -gt $taSec ] ;then
+								#less than 30 days then check if default file presnt
+								log_msg -l ${LOGFILE} -t -q -s "Date from enabling the tool till today is less than 30 days. Hence taking the default files generated."
+								default_reports
+							fi
+						else
+							default_summary_of_reports
+						fi
+					else
+					default_summary_of_reports
+					fi
+				fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Statistics past 90 days."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select * from dba.Aggregation_Count_History where access_date between dateadd(day,-90,getdate()) and getdate() ; OUTPUT TO ${TEM_DIR}/used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+               log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Aggregated Statistics past 90 days."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select db_object,counter_name,sum(counter_count),max(access_date)  from dba.Aggregation_Count_History  where access_date between dateadd(day,-90,getdate()) and getdate()  group by db_object,counter_name ; OUTPUT TO ${TEM_DIR}/aggregated_used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+
+
+            elif [ "${FROM_DATE}" == "180_days" ]; then 
+				if [ ! ${COMPLETE_RUN} ];then
+					$LS -larth  ${COUNTER_TOOL_STATISTICS_FILES_DIR} | $GREP 180_days_ | $GREP ${_date_today_} > ${TEM_DIR}/default_reports
+					if [ ! -s ${TEM_DIR}/default_reports ];then
+						$LS -larth  ${COUNTER_TOOL_STATISTICS_FILES_DIR} | $GREP 180_days_ | $GREP ${yesterday}  > ${TEM_DIR}/default_reports
+						if [ ! -s ${TEM_DIR}/default_reports ];then
+							dateago=`stat ${COUNTER_TOOL_PARENT_DIR}/.rll_enabled_flag | grep 'Access: [[:digit:]]' | cut -d' ' -f2`
+							dtSec=$(date --date "$dateago" +'%s')
+							timeago='30 days ago'
+							taSec=$(date --date "$timeago" +'%s')
+							if [ $dtSec -gt $taSec ] ;then
+								#less than 30 days then check if default file presnt
+								log_msg -l ${LOGFILE} -t -q -s "Date from enabling the tool till today is less than 30 days. Hence taking the default files generated."
+								default_reports
+							fi
+						else
+							default_summary_of_reports
+						fi
+					else
+					default_summary_of_reports
+					fi
+				fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Statistics past 180 days."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select * from dba.Aggregation_Count_History where access_date between dateadd(day,-180,getdate()) and getdate() ; OUTPUT TO ${TEM_DIR}/used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT "   >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Aggregated Statistics past 180 days."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select db_object,counter_name,sum(counter_count),max(access_date)  from dba.Aggregation_Count_History  where access_date between dateadd(day,-180,getdate()) and getdate() group by db_object,counter_name ; OUTPUT TO ${TEM_DIR}/aggregated_used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+
+            elif [ "${FROM_DATE}" == "1_year" ]; then
+				if [ ! ${COMPLETE_RUN} ];then
+					$LS -larth  ${COUNTER_TOOL_STATISTICS_FILES_DIR} | $GREP 1_year_ | $GREP ${_date_today_} > ${TEM_DIR}/default_reports
+					if [ ! -s ${TEM_DIR}/default_reports ];then
+						$LS -larth  ${COUNTER_TOOL_STATISTICS_FILES_DIR} | $GREP 1_year_ | $GREP ${yesterday}  > ${TEM_DIR}/default_reports
+						if [ ! -s ${TEM_DIR}/default_reports ];then
+							dateago=`stat ${COUNTER_TOOL_PARENT_DIR}/.rll_enabled_flag | grep 'Access: [[:digit:]]' | cut -d' ' -f2`
+							dtSec=$(date --date "$dateago" +'%s')
+							timeago='30 days ago'
+							taSec=$(date --date "$timeago" +'%s')
+							if [ $dtSec -gt $taSec ] ;then
+								#less than 30 days then check if default file presnt
+								log_msg -l ${LOGFILE} -t -q -s "Date from enabling the tool till today is less than 30 days. Hence taking the default files generated."
+								default_reports
+							fi
+						else
+							default_summary_of_reports
+						fi
+					else
+					default_summary_of_reports
+					fi
+				fi			
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Statistics past 1 year."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select * from dba.Aggregation_Count_History where access_date between dateadd(year,-1,getdate()) and getdate() ; OUTPUT TO ${TEM_DIR}/used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Aggregated Statistics past 1 year."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select db_object,counter_name,sum(counter_count), max(access_date)  from dba.Aggregation_Count_History  where access_date between dateadd(year,-1,getdate()) and getdate()  group by db_object,counter_name ; OUTPUT TO ${TEM_DIR}/aggregated_used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+
+            elif [ "${FROM_DATE}" == "default" ]; then 
+				if [ ! ${COMPLETE_RUN} ];then
+                    FROM_DATE=default
+			        default_reports
+			        default_summary_of_reports
+				fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Statistics from entire database."
+                ${IQDIR}/bin64/dbisql  ${DWH_CONN_STR_USER_DBA} "select * from dba.Aggregation_Count_History ; OUTPUT TO ${TEM_DIR}/used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Aggregated Statistics."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select db_object,counter_name,sum(counter_count), max(access_date)  from dba.Aggregation_Count_History  group by db_object,counter_name ; OUTPUT TO ${TEM_DIR}/aggregated_used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+
+            else
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Statistics."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select * from dba.Aggregation_Count_History where access_date='${FROM_DATE}' ; OUTPUT TO ${TEM_DIR}/used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT "  >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                   _err_msg_="Could not get used counters from database."
+                   abort_script "${_err_msg_}"
+                fi
+                log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Aggregated Statistics."
+                ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select db_object,counter_name,sum(counter_count),max(access_date)  from dba.Aggregation_Count_History  where access_date='${FROM_DATE}' group by db_object,counter_name ; OUTPUT TO ${TEM_DIR}/aggregated_used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+                if [ $? -ne 0 ];then
+                    _err_msg_="Could not get used counters from database."
+                    abort_script "${_err_msg_}"
+                fi
+
+            fi
+
+        elif [ "${FROM_DATE}" -a "${TO_DATE}" ]; then
+            log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Statistics for the required date range."
+            ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select * from dba.Aggregation_Count_History where access_date between '${FROM_DATE}' and '${TO_DATE}' ; OUTPUT TO ${TEM_DIR}/used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+               if [ $? -ne 0 ];then
+                   _err_msg_="Could not get used counters from database."
+                   abort_script "${_err_msg_}"
+               fi
+
+            log_msg -l ${LOGFILE} -t -s "Collecting Counters Accessed Aggregated Statistics for the required date range."
+            ${IQDIR}/bin64/dbisql ${DWH_CONN_STR_USER_DBA} "select db_object,counter_name,sum(counter_count),access_date  from dba.Aggregation_Count_History  where access_date between '${FROM_DATE}' and '${TO_DATE}' group by db_object,counter_name,access_date ; OUTPUT TO ${TEM_DIR}/aggregated_used_counters.txt APPEND HEXADECIMAL ASIS FORMAT TEXT " >> /dev/null 2>&1;
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not get used counters from database."
+                abort_script "${_err_msg_}"
+            fi
+
+
+        fi        
+
+
+if [ ! -f ${TEM_DIR}/used_counters.txt ] ;then
+        log_msg -l ${LOGFILE} -t -s "Accessed Counters file not present...No counter accessed in the mentioned period."
+        $RM -rf ${MASTER_FILE}
+        $RM -rf ${MASTER_FILE_USR_DISP}
+        $RM -rf ${TEM_DIR}
+        exit 0
+else
+    if [ ! -s ${TEM_DIR}/used_counters.txt ] ;then
+        log_msg -l ${LOGFILE} -t -s "Accessed Counters file blank...No counter accessed in the mentioned period."
+        $RM -rf ${MASTER_FILE}
+        $RM -rf ${MASTER_FILE_USR_DISP}
+        $RM -rf ${TEM_DIR}
+        exit 0
+    fi
+    
+    $SED -i "s/'//g" ${TEM_DIR}/used_counters.txt;$SED -i 's/,/::/g' ${TEM_DIR}/used_counters.txt
+    $SED -i "s/'//g" ${TEM_DIR}/aggregated_used_counters.txt;$SED -i 's/,/::/g' ${TEM_DIR}/aggregated_used_counters.txt
+
+
+
+    # need to chwck if tp name is correct
+    if [ "${TECHPACK}" ];then
+        log_msg -l ${LOGFILE} -t -s "Techpack name provided based filteration of the accesed counters."
+        if [ ${no_of_args} -ne 1 ];then
+            if [ -f ${TECHPACK} ];then
+                $CAT ${TECHPACK} >  ${TEM_DIR}/input_techpacks.txt
+            else
+                $ECHO ${TECHPACK} >  ${TEM_DIR}/input_techpacks.txt
+            fi
+            
+            for tp in `$CAT ${TEM_DIR}/input_techpacks.txt | $SORT -u`;do
+                $CAT ${WORK_DIR}/Techpacks.txt | $GREP -w ${tp} > /dev/null 2>&1
+                if [ $? -ne 0 ];then
+                    log_msg -l ${LOGFILE} -t -s "Not a valid Techpack Name.\n"
+                    
+                fi
+            done
+        fi
+
+        #filter used counters and master list based on Tp and 
+        $SED -i "s/$/_/" ${TEM_DIR}/input_techpacks.txt
+        $GREP -if ${TEM_DIR}/input_techpacks.txt ${TEM_DIR}/used_counters.txt > ${TEM_DIR}/used_counters_tp_based.txt
+        $CAT ${TEM_DIR}/used_counters_tp_based.txt > ${TEM_DIR}/used_counters.txt
+        $GREP -if ${TEM_DIR}/input_techpacks.txt ${MASTER_FILE_USR_DISP} > ${TEM_DIR}/master_list_tp_based.txt
+        $CAT ${TEM_DIR}/master_list_tp_based.txt > ${MASTER_FILE_USR_DISP}
+        
+        if [ ! -s ${TEM_DIR}/used_counters.txt ] ;then
+            log_msg -l ${LOGFILE} -t -s "No matching Techpack name found in the accessed counter list.\n"
+            $RM -rf ${MASTER_FILE}
+            $RM -rf ${MASTER_FILE_USR_DISP}
+            $RM -rf ${TEM_DIR}
+            exit 0
+        fi
+    fi
+
+
+    
+    log_msg -l ${LOGFILE} -t -s "Getting Statistics for Unused Counter."
+    if [ -f "${COUNTER_TOOL_STATISTICS_FILES_DIR}/default_${csv_file}" ];then
+    	$CP -pr ${COUNTER_TOOL_STATISTICS_FILES_DIR}/default_${csv_file} ${TEM_DIR}/unused_counters.txt
+    else
+        
+        # filter based on counter from the master file
+        $AWK -F :: '{print $2}' ${TEM_DIR}/aggregated_used_counters.txt | $SED 's/$/::/g' | $SED 's/^/::/g' | $SORT -u > ${TEM_DIR}/counters_used.txt
+        $CAT ${MASTER_FILE_USR_DISP} | $SED 's/$/::/g' > ${TEM_DIR}/master_file_edited.txt
+        $AWK -F "::" 'FNR == NR { h[$2]; next }; !( tolower($2) in h)'  ${TEM_DIR}/counters_used.txt ${TEM_DIR}/master_file_edited.txt > ${TEM_DIR}/unused_counters.txt
+    
+        $ECHO "Still fetching Statistics.Please wait..."
+        $ECHO "This may take some time depending on the size of the statistics. Fetching required statistics..."
+    
+    
+    fi
+fi
+}
+
+
+
+
+
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+
+
+# ENIQ Directories
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_DATABASE_DIR=${ENIQ_BASE_DIR}/database
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Admin bin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Core install script
+ENIQ_CORE_INST_SCRIPT=${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh
+
+# ENIQ SW conf directory
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# ENIQ SW log directory
+CLI_IQ_LOG_DIR=${ENIQ_BASE_DIR}/log/sw_log/iq
+
+
+# File containing the type of OSS installation. Eg. events or statistics
+INST_TYPE_FILE=${ENIQ_CONF_DIR}/ericsson_use_config
+if [ ! -s "${INST_TYPE_FILE}" ]; then
+    _err_msg_="ENIQ install type not defined in ${INST_TYPE_FILE}"
+    abort_script "${_err_msg_}"  "${EXEC_SHELL_CMD}"
+fi
+
+# Read the installation type - should be "events" or "stats"
+INSTALL_TYPE=`$CAT ${INST_TYPE_FILE} | $AWK -F\= '{print $2}'`
+
+# VAR TMP directory
+VAR_TEMP=/var/tmp
+
+# Create a temporary Directory
+TEM_DIR=/tmp/counter_tool.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+$CHMOD 777 $TEM_DIR
+
+# Work Directories
+COUNTER_TOOL_PARENT_DIR=${CLI_IQ_LOG_DIR}/CounterTool
+COUNTER_TOOL_STATISTICS_FILES_DIR=${COUNTER_TOOL_PARENT_DIR}/Statistics
+COUNTER_TOOL_CO_DIR=${COUNTER_TOOL_PARENT_DIR}/CO
+COUNTER_TOOL_RD1_DIR=${COUNTER_TOOL_PARENT_DIR}/RD1
+COUNTER_TOOL_RD2_DIR=${COUNTER_TOOL_PARENT_DIR}/RD2
+WORK_DIR="${COUNTER_TOOL_PARENT_DIR}/working_directory"
+
+# Configuration File
+COUNTER_TOOL_CONFIG_FILE=${ENIQ_CONF_DIR}/counter_recommendation_tool.cfg
+
+# Master File
+MASTER_FILE=${WORK_DIR}/master_file_for_counters_info_final.txt
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+CO_IP_ADDRESS=`$GREP dwhdb /etc/hosts | $AWK '{print $1}'| $SORT -u`
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+    exit 0
+fi
+
+# Check if server is Coordinator or Reader type
+CO_SERVER=""
+RD_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    CO_SERVER="YES"
+elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    RD_SERVER="YES"
+fi
+
+# Source the common functions
+_common_functions_list_="common_functions.lib common_core_install_functions.lib common_migration_functions.lib"
+for lib_file in ${_common_functions_list_}; do
+    if [ -s ${ENIQ_CORE_INST_DIR}/lib/${lib_file} ]; then
+        . ${ENIQ_CORE_INST_DIR}/lib/${lib_file}
+    else
+        _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/${lib_file} not found"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+# Check that the effective id of the user is ${IQ_USER}
+IQ_USER=`iniget DB -v IQUserName -f ${ENIQ_CONF_DIR}/${ENIQ_INI}`
+check_id ${IQ_USER}
+
+
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from  ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+SYSGROUP=`iniget SunOS_GROUP_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+if [ ! "${SYSGROUP}" ]; then
+    _err_msg_="Could not read SYSGROUP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Set the Connect DB parameters
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read DWH_PORT and DWH_ENG values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}"
+fi
+
+if [ "${RD_SERVER}" == "YES" ]; then
+    DWH_READER_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+    if [ ! "${DWH_READER_PORT}" ]; then
+        _err_msg_="Could not read DWH_READER_PORT value from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+
+
+
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! "${DBA_PASSWORD}" ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        err_msg_="Could not get dwhdb DBA Password"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+
+
+
+
+
+# based on the encrypted function pick the connection string
+
+declare -f get_encrypt_file > /dev/null
+if [ $? -eq 0 ];then
+
+    # removing old connection strings
+    $RM -rf ${TEM_DIR}/conn_str_encrypt.txt.*
+    DWH_CONN_STR_USER_DBA="-nogui -onerror exit -c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+    
+    DWH_CONN_STR_USER_DBA_ENC=${TEM_DIR}/conn_str_encrypt.txt.$$
+    
+    # get the encrypted connection string.
+    get_encrypt_file "${DWH_CONN_STR_USER_DBA}" "${DWH_CONN_STR_USER_DBA_ENC}"
+    
+    #assign encrypted variable to the new variable
+    DWH_CONN_STR_USER_DBA=@$DWH_CONN_STR_USER_DBA_ENC
+    
+
+    # removing the old conection strings for repdb
+    $RM -rf ${TEM_DIR}/con_str_encrypt.*
+    
+    #Initialising the connection string for repdb
+    CONN_STR_USER_DBA_REPDB="-nogui -onerror exit -c \"eng=repdb;links=tcpip{host=localhost;port=2641};uid=dba;pwd=${DBA_PASSWORD}\""
+    CONN_STR_USER_DBA_REPDB_ENC=${TEM_DIR}/con_str_encrypt.$$
+
+    # get the encrypted connection string.
+    get_encrypt_file "${CONN_STR_USER_DBA_REPDB}" "${CONN_STR_USER_DBA_REPDB_ENC}"
+    CONN_STR_USER_DBA_REPDB=@$CONN_STR_USER_DBA_REPDB_ENC
+
+
+    if [ "${RD_SERVER}" == "YES" ]; then
+        if [ -f ${ENIQ_CONF_DIR}/install_reader_type ]; then
+            _reader_=`$CAT ${ENIQ_CONF_DIR}/install_reader_type | $GREP "dwh_reader"`
+        else
+            _err_msg_="Could not find the file ${ENIQ_CONF_DIR}/install_reader_type on ${HNAME}"
+            abort_script "${_err_msg_}"
+        fi
+
+        # removing the old conection strings for repdb
+        $RM -rf ${TEM_DIR}/rd_con_str_encrypt.*
+        CONN_STR_USER_DBA_RD_ENC=${TEM_DIR}/rd_con_str_encrypt.$$
+    
+        CONN_STR_USER_DBA_RD="-nogui -onerror exit -c \"uid=dba;pwd=${DBA_PASSWORD};eng=${_reader_};links=tcpip{host=${_reader_};port=${DWH_READER_PORT};dobroadcast=no;verify=no}\""
+
+        # get the encrypted connection string.
+        get_encrypt_file "${CONN_STR_USER_DBA_RD}" "${CONN_STR_USER_DBA_RD_ENC}"
+        CONN_STR_USER_DBA_RD=@$CONN_STR_USER_DBA_RD_ENC
+        
+    fi
+else
+
+    DWH_CONN_STR_USER_DBA="-nogui -onerror exit -c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+
+     
+    if [ "${RD_SERVER}" == "YES" ]; then
+        if [ -f ${ENIQ_CONF_DIR}/install_reader_type ]; then
+            _reader_=`$CAT ${ENIQ_CONF_DIR}/install_reader_type | $GREP "dwh_reader"`
+        else
+            _err_msg_="Could not find the file ${ENIQ_CONF_DIR}/install_reader_type on ${HNAME}"
+            abort_script "${_err_msg_}"
+        fi
+        CONN_STR_USER_DBA_RD="-nogui -onerror exit -c \"uid=dba;pwd=${DBA_PASSWORD};eng=${_reader_};links=tcpip{host=${_reader_};port=${DWH_READER_PORT};dobroadcast=no;verify=no}\""
+    fi
+    
+    CONN_STR_USER_DBA_REPDB="-nogui -onerror exit -c \"eng=repdb;links=tcpip{host=localhost;port=2641};uid=dba;pwd=${DBA_PASSWORD}\""
+
+fi
+
+
+
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/counter_tool_display
+    LOGFILE="${ENIQ_LOG_DIR}/counter_tool_display/counter_recommendation_tool_User_Display_${RUN_TIME}.log"
+fi
+
+
+
+}
+
+    
+### Function: user_display ###
+#
+#   Display on GUI
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+user_display()
+{
+timeStr=`$DATE '+%d-%m-%Y_%H-%M-%S'`
+MASTER_FILE_USR_DISP=${TEM_DIR}/master_file_for_user_display.txt
+unused_counter_file=${TEM_DIR}/unused_counters.txt
+_date_today_=`date +"%d-%m-%y"`
+yesterday=`date -d "yesterday" '+%d-%m-%Y'`							   
+if [ ${no_of_args} -eq 0 ];then
+    clear
+    get_feature_list
+
+
+    while :; do
+        $ECHO -e "\n\nAvailable Time Levels."
+        $ECHO -e "\n[1] PAST 1 DAY"
+        $ECHO -e "[2] PAST 7 DAYS"
+        $ECHO -e "[3] PAST 30 DAYS"
+        $ECHO -e "[4] PAST 90 DAYS"
+        $ECHO -e "[5] PAST 180 DAYS"
+        $ECHO -e "[6] PAST 1 YEAR"
+        $ECHO -e "[7] SPECIFIC DATE RANGE"
+        $ECHO -e "\nSelect the option you wish to retrieve statistics.\nIf skipped all available data would be taken by default.\n"
+        read input
+        
+        # Did user enter anything
+        if [ ! "${input}" ]; then
+             $ECHO -e "\nNo Time Interval Selected. Considering entire database by default."
+             FROM_DATE=default
+             break
+        fi
+        if [ "${input}" == "1" ];then
+            FROM_DATE=1_day
+        elif [ "${input}" == "2" ];then
+            FROM_DATE=7_days
+        elif [ "${input}" == "3" ];then
+            FROM_DATE=30_days
+        elif [ "${input}" == "4" ];then
+            FROM_DATE=90_days
+        elif [ "${input}" == "5" ];then
+            FROM_DATE=180_days
+        elif [ "${input}" == "6" ];then
+            FROM_DATE=1_year
+        elif [ "${input}" == "7" ];then
+            while :; do
+                $ECHO -e "\n\nEnter the Start Date in yyyy-mm-dd format."
+                read FROM_DATE
+                
+                
+                # Did user enter anything
+                if [ ! "${FROM_DATE}" ]; then
+                    continue
+                fi
+                $ECHO "${FROM_DATE}" | $GREP -q '^[0-9]\{4\}-[0-1][0-9]-[0-3][0-9]$' > /dev/null 2>&1 
+                format=$?
+                date "+%Y-%m-%d" -d "${FROM_DATE}" > /dev/null  2>&1
+                is_valid=$?
+                if [ ${is_valid} -ne 0 -o ${format} -ne 0 ];then
+                    continue
+                    
+                fi 
+                break
+            done
+            while :; do
+                $ECHO -e "\n\nEnter the End Date in yyyy-mm-dd format."
+                read TO_DATE
+                
+                
+                # Did user enter anything
+                if [ ! "${TO_DATE}" ]; then
+                    continue
+                fi
+                $ECHO "${TO_DATE}" | $GREP -q '^[0-9]\{4\}-[0-1][0-9]-[0-3][0-9]$' > /dev/null 2>&1 
+                format=$?
+                date "+%Y-%m-%d" -d "${TO_DATE}" > /dev/null  2>&1
+                is_valid=$?
+                if [ ${is_valid} -ne 0 -o ${format} -ne 0 ];then
+                    continue
+                    
+                fi
+                break
+            done
+        else
+            $ECHO -e "Please select a valid Time Range."
+            continue
+        fi
+         break
+    done
+
+
+
+fi
+
+$MKDIR -p ${COUNTER_TOOL_STATISTICS_FILES_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${_dir_path_}"
+    abort_script "$_err_msg_" "${EXEC_SHELL_CMD}"
+fi
+
+# create master file
+if [ ! -f ${MASTER_FILE} ]; then
+    get_master_list_from_repdb
+fi
+
+$CAT ${MASTER_FILE} > ${MASTER_FILE_USR_DISP}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${MASTER_FILE_USR_DISP} file"
+    abort_script "${_err_msg_}"
+fi
+
+
+if [ ! -f "${WORK_DIR}/master_list_with_feature.txt" ];then
+    get_master_file_with_features
+fi
+
+# get the used counters from db_object based on date
+log_msg -l ${LOGFILE} -t -s "Starting to fetch used counters, please wait for few minutes......"
+get_used_columns_from_database
+
+if [ ! -s "${TEM_DIR}/unused_counters.txt" -o ! -s "${TEM_DIR}/used_counters.txt" ];then
+    if [ -s "${TEM_DIR}/unused_counters.txt" ];then
+        get_feature_name_from_tn ${TEM_DIR}/unused_counters.txt 
+        $CAT ${TEM_DIR}/overall_used_with_feature.txt | $TR -s '::' ',' > ${COUNTER_TOOL_STATISTICS_FILES_DIR}/${timeStr}_unused_counter_list_file.csv
+        log_msg -l ${LOGFILE} -t -s "Only Unaccessed data present for this input : ${COUNTER_TOOL_STATISTICS_FILES_DIR}/${timeStr}_unused_counter_list_file.csv"
+    elif [ -s "${TEM_DIR}/used_counters.txt" ];then
+        get_feature_name_from_tn ${TEM_DIR}/used_counters.txt
+        $CAT ${TEM_DIR}/overall_used_with_feature.txt | $TR -s '::' ',' > ${COUNTER_TOOL_STATISTICS_FILES_DIR}/${timeStr}_used_counter_list_file.csv
+        log_msg -l ${LOGFILE} -t -s "Only Accessed data present for this input : ${COUNTER_TOOL_STATISTICS_FILES_DIR}/${timeStr}_used_counter_list_file.csv"
+    else
+        log_msg -l ${LOGFILE} -t -s "No data available. Accessed or Unaccessed files not created."
+    fi
+    $RM -rf ${MASTER_FILE_USR_DISP}
+    $RM -rf ${MASTER_FILE}
+    $RM -rf ${MASTER_FILE_USR_DISP}
+    $RM -rf ${TEM_DIR}
+    exit 0
+fi
+
+if [ -f ${TEM_DIR}/unused_counters.txt -a  -f ${TEM_DIR}/used_counters.txt ];then
+
+    unused_counter_list=${TEM_DIR}/unused_counters.txt
+
+    combine_reports
+    aggregated_counters=${TEM_DIR}/distinct_key_aggregated_counters.txt 
+    counter_data_per_date=${TEM_DIR}/counter_data_per_date.txt 
+   
+    display_python_summary
+
+else
+    $RM -rf ${MASTER_FILE_USR_DISP}
+    log_msg -l ${LOGFILE} -t -s "No data available. Accessed and Unaccessed Files not present." 
+fi
+
+
+
+}
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+clear
+$ECHO "
+Usage: /usr/bin/bash `$BASENAME $0` [ -l <path_to_logfile> ]
+
+-d  :   Mandatory parameter for user_display.Provide 'Date' for which you wish to retrieve the statistics in yyyy-mm-dd format.
+        Other parameters that can be passed : 1_day,7_days,30_days, 90_days, 180_days,1_year for past 1. day, 7 days, a month,etc. Can use default to consider entire database <default>
+        Format: Usage: /usr/bin/bash `$BASENAME $0` -d <From Date>
+
+-t  :   Optional parameter for user_display action type. To retrieve the statistics for a range of dates this needs to be passed.
+        Format: Usage: /usr/bin/bash `$BASENAME $0` -d <From Date> -t <To Date>
+
+-p  :   Optional parameter for user_display action type. To retrieve the statistics for a particular Techpack this needs to be passed.
+        Format: Usage: /usr/bin/bash `$BASENAME $0` -d <From Date> -t <To Date> -p <Techpack Name>
+
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+RUN_TIME=`$DATE '+%Y-%m-%d_%H:%M:%S'`
+no_of_args=$#
+
+while getopts "cd:t:p:l:" arg; do
+  case $arg in
+    c) COMPLETE_RUN="YES"
+       ;;
+    d) FROM_DATE="$OPTARG"
+       ;;
+    t) TO_DATE="$OPTARG"
+       ;;
+    p) TECHPACK="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    \?) usage_msg
+       abort_script "$($DATE '+%Y-%m-%d_%H.%M.%S'): Unknown argument passed to script."
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+
+
+# Determine absolute path to software
+check_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+#check parameters
+check_params
+
+log_msg -l ${LOGFILE} -s "\n********************* ${RUN_TIME} : Starting to generate Statistics on ${HNAME} *********************\n"
+# # check if DB is up
+check_server_running dwhdb
+if [ ${SERVER_STATUS} -eq 0 ]; then
+        log_msg -t -s "Database is not running, hence could not retrieve  the statsistics." -l ${LOGFILE}
+        exit 1
+fi
+
+if [ ! -s "${WORK_DIR}/Interface_and_Techpacks.txt" ];then
+    get_intf_from_repdb
+fi
+
+if [ ! -s "${WORK_DIR}/Techpacks.txt" ];then
+    get_tp_from_repdb
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    user_display
+else
+    log_msg -t -s "Please execute the script on Coordinator." -l ${LOGFILE}
+    exit 0
+fi
+
+log_msg -l ${LOGFILE} -s "\n********************* $($DATE '+%Y-%m-%d_%H:%M:%S') : Successfully completed Generating Reports*********************\n"
+
+$RM -rf ${MASTER_FILE}
+$RM -rf ${MASTER_FILE_USR_DISP}
+$RM -rf ${TEM_DIR}
+exit 0
+

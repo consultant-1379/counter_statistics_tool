@@ -1,0 +1,2432 @@
+#!/bin/bash
+# ********************************************************************
+# Ericsson Radio Systems AB                                     SCRIPT
+# ********************************************************************
+#
+#
+# (c) Ericsson Radio Systems AB 2020 - All rights reserved.
+#
+# The copyright to the computer program(s) herein is the property
+# of Ericsson Radio Systems AB, Sweden. The programs may be used
+# and/or copied only with the written permission from Ericsson Radio
+# Systems AB or in accordance with the terms and conditions stipulated
+# in the agreement/contract under which the program(s) have been
+# supplied.
+#
+# ********************************************************************
+# Name    : counter_statistics_tool.bsh
+# Date    : 8/12/2020
+# Revision: main\04
+# Purpose : To identify the unused counters and inform user about it
+# Usage   : counter_statistics_tool.bsh -a <Data_Collection|Parse_Level1|Parse_Level2|Parse_Level3|<Flush_Metadata>|<Flush_Metadata>|<Cleanup>
+#
+# ********************************************************************
+#
+#     Command Section
+#
+# ********************************************************************
+AWK=/usr/bin/awk
+BASENAME=/usr/bin/basename
+BASH=/usr/bin/bash
+CAT=/usr/bin/cat
+CD=/usr/bin/cd
+CHMOD=/usr/bin/chmod
+CHOWN=/usr/bin/chown
+CUT=/usr/bin/cut
+DATE=/usr/bin/date
+DIRNAME=/usr/bin/dirname
+ECHO='/usr/bin/echo -e'
+EGREP=/usr/bin/egrep
+EXPR=/usr/bin/expr
+FIND=/usr/bin/find
+GETENT=/usr/bin/getent
+GREP=/usr/bin/grep
+HEAD=/usr/bin/head
+ID=/usr/bin/id
+LS=/usr/bin/ls
+MYHOSTNAME=/usr/bin/hostname
+MKDIR=/usr/bin/mkdir
+MV=/usr/bin/mv
+PERL=/usr/bin/perl
+RM=/usr/bin/rm
+SED=/usr/bin/sed
+SORT=/usr/bin/sort
+SSH=/usr/bin/ssh
+SYSTEMCTL=/usr/bin/systemctl
+TAR=/usr/bin/tar
+XARGS=/usr/bin/xargs
+WC=/usr/bin/wc
+
+    
+# ********************************************************************
+#
+#       Configuration Section
+#
+# ********************************************************************
+
+# Name of the ini Files
+SUNOS_INI=SunOS.ini
+ENIQ_INI=niq.ini
+# ********************************************************************
+#
+#   Functions
+#
+# ********************************************************************
+
+### Function: abort_script ###
+#
+#   This will is called if the script is aborted thru an error
+#   error signal sent by the kernel such as CTRL-C or if a serious
+#   error is encountered during runtime
+#
+# Arguments:
+#       $1 - Error message from part of program (Not always used)
+# Return Values:
+#       none
+abort_script()
+{
+if [ "$1" ]; then
+    _err_msg_=$1
+else
+    _err_msg_="$($DATE '+%Y-%m-%d_%H.%M.%S'): Script aborted.......\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n$_err_msg_\n"|$TEE -a ${LOGFILE}
+else
+    $ECHO "\n$_err_msg_\n"
+fi
+
+if [ "${LOGFILE}" ]; then
+    $ECHO "\n${green}Please find the log file: ${LOGFILE}${reset}"
+fi
+
+$RM -rf ${TEM_DIR}
+
+if [ "$2" ]; then
+    exit ${2}
+else
+   exit 1
+fi
+
+}
+
+### Function: add_cron_entry ###
+#
+# Add master cron entry in crontab
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+add_cron_entry()
+{
+$CAT ${CRON_FILE} | $GREP -w "${ENIQ_ADMIN_BIN_DIR}/counter_tool_master_cron.bsh" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    $CHMOD 755 ${ENIQ_ADMIN_BIN_DIR}/counter_tool_master_cron.bsh
+    master_cron_entry="0 * * * * [ -x ${ENIQ_ADMIN_BIN_DIR}/counter_tool_master_cron.bsh ] && ${ENIQ_ADMIN_BIN_DIR}/counter_tool_master_cron.bsh >> /dev/null 2>&1"
+    $ECHO "${master_cron_entry}" >> ${CRON_FILE}
+    $CAT ${CRON_FILE} | $GREP -w "${ENIQ_ADMIN_BIN_DIR}/counter_tool_master_cron.bsh" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        log_msg -l ${LOGFILE} -t -s "master cron entry for counter tool has been added successfully in crontab"
+    else
+        _err_msg_="Failed to add master cron entry for counter tool in crontab\n"
+        abort_script "$_err_msg_"
+    fi
+
+else
+    log_msg -l ${LOGFILE} -t -s "Skipping.....master cron entry already exists in the crontab"
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    ddc_cron_file="/opt/ericsson/ERICddc/monitor/appl/ENIQ/accessedCounterDataCollection.bsh"
+    $CAT ${CRON_FILE} | $GREP -w "${ddc_cron_file}" >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        if [ -f ${ddc_cron_file} ];then
+            $CHMOD 755 ${ddc_cron_file}
+            ddc_cron_entry="0 4 * * * [ -x /opt/ericsson/ERICddc/monitor/appl/ENIQ/accessedCounterDataCollection.bsh ] && /opt/ericsson/ERICddc/monitor/appl/ENIQ/accessedCounterDataCollection.bsh >> /dev/null 2>&1"
+            $ECHO "${ddc_cron_entry}" >> ${CRON_FILE}
+            $CAT ${CRON_FILE} | $GREP -w "${ddc_cron_file}" >> /dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                log_msg -l ${LOGFILE} -t -q -s "DDC cron entry for counter tool has been added successfully in crontab"
+            else
+                _err_msg_="Failed to add DDC cron entry for counter tool in crontab\n"
+                abort_script "$_err_msg_"
+            fi
+        else
+            log_msg -l ${LOGFILE} -t -q -s "DDC is not available on ${HNAME}. Hence not configuring DDC Cron. Tool is enabled."
+        fi
+    
+    else
+        log_msg -l ${LOGFILE} -t -q -s "Skipping.....DDC cron entry already exists in the crontab"
+    
+    fi
+fi
+
+}
+
+### Function: check_bladewise_counter_dir ###
+#
+# Determine bladewise counter dir
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_bladewise_counter_dir()
+{
+# create bladewise directories
+if [ "${CO_SERVER}" == "YES" ]; then
+    COUNTER_TOOL_DIR="${COUNTER_TOOL_CO_DIR}"
+elif [ "${RD_SERVER}" == "YES" ]; then
+    if [ "${_reader_}" == "dwh_reader_1" ]; then
+        COUNTER_TOOL_DIR="${COUNTER_TOOL_RD1_DIR}"
+    elif [ "${_reader_}" == "dwh_reader_2" ]; then
+        COUNTER_TOOL_DIR="${COUNTER_TOOL_RD2_DIR}"
+    fi
+fi
+}
+
+### Function: check_absolute_path ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+check_absolute_path()
+{
+_dir_=`$DIRNAME $0`
+SCRIPTHOME=`cd ${_dir_} 2>/dev/null && pwd || $ECHO ${_dir_}`
+}
+
+### Function: check_server_running ###
+#
+# Checks to see if the required server is running (dwhdb, repdb)
+#
+# Arguments:
+#
+# Return Values:
+#       none
+check_server_running()
+{
+SERVER_STATUS=1
+if [ "${1}" == "dwhdb" ]
+then
+    port=${DWH_PORT}
+else
+    port=${DWH_READER_PORT}
+fi
+
+
+# Check if server is up
+if [ "${CO_SERVER}" == "YES" ]; then
+    $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q -c "con=${1};eng=${1};links=tcpip{host=${1};port=${port};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}""  2>>${LOGFILE} 1>/dev/null
+    if [ $? -ne 0 ] ; then
+        SERVER_STATUS=0
+        log_msg -t -s "$1 is not running, aborting." -l ${LOGFILE}
+        #exit 1 
+    fi
+elif [ "${RD_SERVER}" == "YES" ]; then
+    $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q -c "con=${1};eng=${1};links=tcpip{host=${1};port=${port};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}""  2>>${LOGFILE} 1>/dev/null
+    if [ $? -ne 0 ] ; then
+        SERVER_STATUS=0
+        log_msg -t -s "$1 is not running, aborting." -l ${LOGFILE}
+        #exit 1 
+    fi
+fi
+}
+
+
+
+### Function: check_params ###
+#
+# Check the expected parameters
+#
+# Arguments:
+#
+# Return Values:
+#       none
+check_params()
+{
+
+# Check that we got the required action type
+if [ ! "${ACTION_TYPE}" ]; then
+       usage_msg
+       $ECHO "ERROR: Required parameters not passed."
+       exit 1
+fi
+
+if [ "${ACTION_TYPE}" != "data_collection" -a "${ACTION_TYPE}" != "disable_logging" -a "${ACTION_TYPE}" != "parse_levels" -a "${ACTION_TYPE}" != "cleanup" -a "${ACTION_TYPE}" != "aggregation" ]; then
+      usage_msg
+      $ECHO "ERROR: Not a valid action type"
+      exit 1
+fi
+
+
+
+}
+
+
+
+### Function: cleanup ###
+#
+# To clean daily temp files, archive files and
+# delete archived files based on retention period
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+cleanup()
+{
+#Deleting rows older than 395 days
+log_msg -l ${LOGFILE} -t -s "Deleting rows from database older than a year on ${HNAME}"
+
+$SU - ${SYSUSER} -c "dbisql ${CONN_STR_USER_DBA} \"delete from dba.Aggregation_Count_History where access_date = dateadd(day,-395,getdate()) ;\"" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    log_msg -l ${LOGFILE} -t -s "Not able to delete rows older than a year.\n"
+fi
+
+log_msg -l ${LOGFILE} -t -s "Cleaning up files on ${HNAME}"
+if [ -f ${COUNTER_TOOL_CONFIG_FILE} ]; then
+        for _entry_ in `$CAT ${COUNTER_TOOL_CONFIG_FILE} | $GREP -v "#"` ; do
+                dir_path_to_check_=`$ECHO ${_entry_} | $AWK -F:: '{ print $1 }'`
+                _dir_to_check=`$BASENAME ${dir_path_to_check_}`
+                retention_period=`$ECHO ${_entry_} | $AWK -F:: '{ print $2 }'`
+                $FIND ${dir_path_to_check_} -type f -mtime +${retention_period} | $XARGS $RM -rf
+        done
+fi
+
+
+#create TP masterlist
+log_msg -l ${LOGFILE} -t -s "Creating Techpack List master file"
+$RM -rf ${WORK_DIR}/Techpacks.txt
+$SU - ${SYSUSER} -c "dbisql ${CONN_STR_USER_DBA_REPDB} \"select TECHPACKNAME from dwhrep.InterfaceTechpacks; OUTPUT TO ${TEM_DIR}/Techpacks.txt APPEND HEXADECIMAL ASIS FORMAT TEXT DELIMITED BY ' ' QUOTE '' ;\"" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Not able get Techpack list.\n"
+    abort_script "$_err_msg_"
+fi
+
+$SORT -u ${TEM_DIR}/Techpacks.txt  > ${WORK_DIR}/Techpacks.txt
+
+#get TP and interface name
+log_msg -l ${LOGFILE} -t -s "Creating Interface and Techpack master file"
+$SU - ${SYSUSER} -c "dbisql ${CONN_STR_USER_DBA_REPDB} \"select INTERFACENAME,TECHPACKNAME from dwhrep.InterfaceTechpacks; OUTPUT TO ${TEM_DIR}/intf_for_TP.txt APPEND HEXADECIMAL ASIS FORMAT TEXT DELIMITED BY ' ' QUOTE '' ;\"" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not fetch counter info for all tables from repdb.\n"
+    abort_script "$_err_msg_"
+fi
+$CAT ${TEM_DIR}/intf_for_TP.txt | $SORT -u > ${WORK_DIR}/Interface_and_Techpacks.txt
+
+
+log_msg -l ${LOGFILE} -t -s "Successfully completed cleanup on ${HNAME}"
+}
+
+
+### Function: clean_parsing_2_files ###
+#
+# Delete temporary files after parsing level 2
+#
+# Arguments:
+#       none
+# Return Values:
+#       Restoring .ini file
+clean_parsing_2_files()
+{
+$RM -rf ${MASTER_FILE}
+$RM -rf ${KEY_COLUMN_LIST}
+$RM -rf ${WORK_DIR}/level_2_input_files
+$RM -rf ${WORK_DIR}/parallel_threads
+$RM -rf ${WORK_DIR}/level_2_output_files
+$RM -rf ${WORK_DIR}/logfiles
+}
+
+### Function: clear_dwhdb_failed_state ###
+#
+# Clears the dwhdb database from a failed state
+#
+# Arguments:
+#       $1 = stop / start
+# Return Values:
+#       None
+#
+clear_dwhdb_failed_state ()
+{
+_dwhdb_action_="$1"
+_service_name_="$2"
+log_msg -l ${LOGFILE} -t -s "Found ${_dwhdb_service_name_} in ${_dwhdbstate_} state during service ${_dwhdb_action_}. Clearing the ${_dwhdbstate_} state and attempting to ${_dwhdb_action_} the ${_dwhdb_service_name_} service."
+$SYSTEMCTL reset-failed ${_dwhdb_service_name_}
+
+_dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+if [ "${_dwhdbstate_}" == "inactive" ]; then
+    if [ "${_dwhdb_action_}" == "start" ]; then
+        /usr/bin/bash ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ${_service_name_} -N -l ${LOGFILE}
+
+        _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`   
+        if [ "${_dwhdbstate_}" != "active" ]; then
+            restore_backup_file
+            revert_eng_profile
+            _err_msg_="Could not get the current state for ${_dwhdb_service_name_} or ${_dwhdb_service_name_} is still in ${_dwhdbstate_} at `$DATE`. Kindly contact Ericsson support\n"
+            abort_script "$_err_msg_"
+        elif [ "${_dwhdbstate_}" == "active" ]; then
+            log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} has started successfully\n"
+        fi
+    elif [ "${_dwhdb_action_}" == "stop" ]; then
+        log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} stopped successfully\n"
+    fi
+else
+    restore_backup_file
+    revert_eng_profile
+    _err_msg_="${_dwhdb_service_name_} is in ${_dwhdbstate_} state at `$DATE`. Kindly contact Ericsson support\n"
+    abort_script "$_err_msg_"
+fi
+}
+
+### Function: create_aggregated_data_file ###
+#
+# Create aggregated file with consolidated data on each blade
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_aggregated_data_file(){
+for date_to_find in `$CAT ${COUNTER_TOOL_PARENT_DIR}/date_to_aggregate.txt | $SORT -u`; do
+    skip_flag=0
+    if [ -f ${COUNTER_TOOL_PARENT_DIR}/.failed_aggregation_flag.txt ]; then
+        $CAT ${COUNTER_TOOL_PARENT_DIR}/.failed_aggregation_flag.txt | $GREP -w $date_to_find >> /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            if [ -s ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log ]; then
+                skip_flag=1
+            fi
+        fi
+    fi
+    
+    if [ $skip_flag -eq 1 ]; then
+        continue
+    else
+        date_to_insert=`$ECHO ${date_to_find} | $AWK -v FS=- -v OFS=- '{print $3,$2,$1}'`
+        log_msg -l ${LOGFILE} -t -s "Getting count for individual counter for date - ${date_to_find}"
+        $FIND ${COUNTER_TOOL_DIR}/files_to_parse_L2 -type f | $GREP ${date_to_find} >> /dev/null 2>&1
+        if [ $? -ne 0 ] ; then
+            $SED -i "/${date_to_find}/d" ${COUNTER_TOOL_PARENT_DIR}/date_to_aggregate.txt
+            log_msg -t -l ${LOGFILE} -s "No parsed file present for ${date_to_find}. Does not require aggregation for date : ${date_to_find} "
+            $FIND ${COUNTER_TOOL_DIR}/files_to_parse_L1 -type f | $GREP ${date_to_find} | $XARGS $RM -rf
+            continue
+        else
+            if [ ! -f ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log ]; then
+                $TOUCH ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log
+            fi
+            $CAT ${COUNTER_TOOL_DIR}/files_to_parse_L2/${date_to_find}* | $AWK -F "::" '{print $1}'| $SORT -u > ${TEM_DIR}/databse_object_list.txt
+            for database_object in `$CAT ${TEM_DIR}/databse_object_list.txt`; do
+                $CAT ${COUNTER_TOOL_DIR}/files_to_parse_L2/${date_to_find}* | $GREP -w $database_object | $GREP -v "ALL" | $AWK -F "::" '{print $3}' | $SORT -u > ${TEM_DIR}/distinct_counters_list.txt
+                #Collecting count for individual counters 
+                if [ -s ${TEM_DIR}/distinct_counters_list.txt ]; then
+                    for counter_name in `$CAT ${TEM_DIR}/distinct_counters_list.txt`; do
+                        count=`$CAT ${COUNTER_TOOL_DIR}/files_to_parse_L2/${date_to_find}* | $GREP -iw $database_object | $GREP -iw $counter_name | wc -l`
+                        if [ $count -gt 0 ]; then
+                            $ECHO "${database_object}::${counter_name}::${count}::${date_to_insert}" >> ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log
+                        fi
+                    done
+                fi
+
+                #Collecting count for ALL values
+                $CAT ${COUNTER_TOOL_DIR}/files_to_parse_L2/${date_to_find}* | $GREP -w ${database_object} | $GREP -w "ALL" > /dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    count_1=`$CAT ${COUNTER_TOOL_DIR}/files_to_parse_L2/${date_to_find}* | $GREP -iw ${database_object} | $GREP -w "ALL" | $WC -l`
+                    if [ $count_1 -gt 0 ]; then
+                        $CAT ${MASTER_FILE_AGG} | $AWK -F "::" '{print $1}' | $SORT -u > ${TEM_DIR}/distinct_table_name.txt
+                        table_found=0
+                        # last_field=`$ECHO "${database_object}" | $AWK -F "_" '{print $NF}'`
+                        # modified_table=`$ECHO "${database_object}" | $SED "s/_${last_field}//g"`
+                        # for ext in `$CAT ${TEM_DIR}/table_extensions.txt`; do
+                            # $ECHO ${modified_table} | $GREP -i "_${ext}" > /dev/null 2>&1
+                            # if [ $? -eq 0 ]; then 
+                                # modified_tab=`$ECHO ${modified_table} | $SED "s/_${ext}//g"`
+                                # modified_table=`$ECHO ${modified_tab}`
+                                # break
+                            # fi
+                        # done
+						if [[ $database_object = *[0-9] ]];then 
+							modified_table=`$ECHO ${database_object}| $AWK -F "_" 'NF{NF-=2}1' OFS="_"`
+						else
+							modified_table=`$ECHO ${database_object}| awk -F "_" 'NF{NF-=1}1' OFS="_"`
+						fi
+                        $CAT ${TEM_DIR}/distinct_table_name.txt | $GREP -iw "${modified_table}" > /dev/null 2>&1
+                        if [ $? -eq 0 ]; then
+                            table_found=1
+                        fi
+                        if [ $table_found -eq 1 ]; then
+                            $CAT ${MASTER_FILE_AGG} | $GREP -iw "${modified_table}" | $AWK -F "::" '{print $2}' | tr '[:upper:]' '[:lower:]' > ${TEM_DIR}/all_counters_list.txt
+                            for counter_name in `$CAT ${TEM_DIR}/all_counters_list.txt`; do
+                                $CAT ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log | $GREP -iw $database_object | $GREP -iw $counter_name > /dev/null 2>&1
+                                if [ $? -eq 0 ] ; then
+                                    existing_count_1=`$CAT ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log | $GREP -iw ${database_object} | $GREP -iw ${counter_name} |${AWK} -F "::" '{print $3}'`
+                                    final_count_1=`$EXPR ${existing_count_1} + ${count_1}`
+                                    # Replace line with updated count
+                                    $SED -i "/${database_object}::${counter_name}::/c\\${database_object}::${counter_name}::${final_count_1}::${date_to_insert}" ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log 
+                                else
+                                    $ECHO "${database_object}::${counter_name}::${count_1}::${date_to_insert}" >> ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log
+                                fi
+                            done
+                        fi
+                    fi
+                fi
+            done
+            log_msg -t -l ${LOGFILE} -s "Updating count in file ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log"
+        fi
+    fi
+    $CP -pr ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log /eniq/backup/ddc_aggregated/${date_to_find}_aggregated.log
+	$WC -l ${COUNTER_TOOL_PARENT_DIR}/aggregated/${date_to_find}.log >> ${LOGFILE}
+done
+}
+
+
+### Function: create_config_file ###
+#
+# Determine absolute path to software
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+create_config_file()
+{
+log_msg -l ${LOGFILE} -t -s "Creating required configuration files on ${HNAME}"
+if [ ! -f ${COUNTER_TOOL_CONFIG_FILE} ]; then
+    $TOUCH ${COUNTER_TOOL_CONFIG_FILE}
+    $ECHO "# Dir_Name::Retention_Period #" >> ${COUNTER_TOOL_CONFIG_FILE}
+    
+    $ECHO "${COUNTER_TOOL_DIR}/archived_files::14
+    ${COUNTER_TOOL_STATISTICS_FILES_DIR}::7
+    ${FAILED_DIR}::45
+    ${ENIQ_LOG_DIR}/counter_tool_display/::7
+    ${ENIQ_LOG_DIR}/counter_tool::30" > ${TEM_DIR}/logfile_list.txt
+    
+    for _counter_dir_ in `$CAT ${TEM_DIR}/logfile_list.txt`; do
+        $ECHO "${_counter_dir_}" >> ${COUNTER_TOOL_CONFIG_FILE}
+    done
+fi
+
+if [ ! -f ${COUNTER_TOOL_CONFIG_FILE_MULTI_THREAD} ]; then
+    $TOUCH ${COUNTER_TOOL_CONFIG_FILE_MULTI_THREAD}
+    $ECHO "no_of_threads=5
+    no_of_rows_per_file=1000" > ${COUNTER_TOOL_CONFIG_FILE_MULTI_THREAD}
+fi
+log_msg -l ${LOGFILE} -t -s "Successfully created required configuration files on ${HNAME}"
+}
+   
+
+### Function: create_demarcation_CO ###
+#
+# Create demarcation in CO
+#
+# Arguments:
+# Return Values:
+#       none
+create_demarcation_CO()
+{
+if [ ! -f ${COUNTER_TOOL_DIR}/demarcation_metadata_file ]; then
+    $TOUCH ${COUNTER_TOOL_DIR}/demarcation_metadata_file
+    $GREP -w "${_date_today_}_demarcation_1" ${RLL_LOG_FILE} >> /dev/null 2>&1
+    if [ $? -ne 0 ];then 
+        $ECHO "PRINT '${_date_today_}"_demarcation_1"'"> ${_query_file_}
+        $SU - $SYSUSER >> /dev/null  -c "${IQDIR}/bin64/dbisql ${CONN_STR_USER_DBA} '${_query_file_}' 2>&1";
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not print demarcation in database"
+            abort_script "${_err_msg_}"
+        fi
+        log_msg -l ${LOGFILE} -t -s "Created first instance of the demarcation on ${HNAME}\n"
+    else
+        log_msg -l ${LOGFILE} -t -s "First instance demarcation already created on ${HNAME}\n"
+    fi
+        $ECHO $_date_today_"_demarcation_1" > ${COUNTER_TOOL_DIR}/demarcation_metadata_file 
+    
+else
+    $GREP  "${_date_today_}" ${COUNTER_TOOL_DIR}/demarcation_metadata_file >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+        _demarcation_instance_=`$CAT ${COUNTER_TOOL_DIR}/demarcation_metadata_file | $CUT -d "_" -f3`
+        _demarcation_instance_=`$EXPR $_demarcation_instance_ + 1`
+        $GREP -w "${_date_today_}_demarcation_${_demarcation_instance_}" ${RLL_LOG_FILE} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then 
+            $ECHO "PRINT '${_date_today_}"_demarcation_${_demarcation_instance_}"'"> ${_query_file_}
+            $SU - $SYSUSER >> /dev/null  -c "${IQDIR}/bin64/dbisql ${CONN_STR_USER_DBA} '${_query_file_}' 2>&1";
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not print demarcation in database"
+                abort_script "${_err_msg_}"
+            fi
+            log_msg -l ${LOGFILE} -t -s "Created demarcation instance : ${_demarcation_instance_} on ${HNAME}\n"
+        else
+            log_msg -l ${LOGFILE} -t -s "Demarcation instance : ${_demarcation_instance_} already created on ${HNAME}"
+        fi
+    else
+        log_msg -l ${LOGFILE} -t -s "Current date and date present in metadata file is different."
+        date_in_metadata=`$CAT ${COUNTER_TOOL_DIR}/demarcation_metadata_file | $CUT -d '_' -f1`
+        _demarcation_instance_=`$CAT ${COUNTER_TOOL_DIR}/demarcation_metadata_file | $CUT -d "_" -f3`
+        _demarcation_instance_=`$EXPR $_demarcation_instance_ + 1`
+        $GREP -w "${date_in_metadata}_demarcation_${_demarcation_instance_}" ${RLL_LOG_FILE} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then 
+            $ECHO "PRINT '${date_in_metadata}"_demarcation_${_demarcation_instance_}"'"> ${_query_file_}
+            $SU - $SYSUSER >> /dev/null  -c "${IQDIR}/bin64/dbisql ${CONN_STR_USER_DBA} '${_query_file_}' 2>&1";
+            if [ $? -ne 0 ];then
+                _err_msg_="Could not print demarcation in database"
+                abort_script "${_err_msg_}"
+            fi
+            log_msg -l ${LOGFILE} -t -s "Created demarcation instance : ${_demarcation_instance_} on ${HNAME}\n"
+        else
+            log_msg -l ${LOGFILE} -t -s "Demarcation instance : ${_demarcation_instance_} already created on ${HNAME}"
+        fi
+    fi
+
+fi
+
+}
+
+
+### Function: create_demarcation_RD ###
+#
+# Create demarcation in RD
+#
+# Arguments:
+# Return Values:
+#       none
+create_demarcation_RD()
+{
+  if [ ! -f ${COUNTER_TOOL_DIR}/demarcation_metadata_file ]; then
+      $TOUCH ${COUNTER_TOOL_DIR}/demarcation_metadata_file
+      $GREP -w "${_date_today_}_demarcation_1" ${RLL_LOG_FILE} >> /dev/null 2>&1
+      if [ $? -ne 0 ];then 
+        $ECHO "PRINT '$_date_today_"_demarcation_1"'"> ${_query_file_}
+        $SU - $SYSUSER >> /dev/null  -c "${IQDIR}/bin64/dbisql ${CONN_STR_USER_DBA_RD} '${_query_file_}' 2>&1";
+        if [ $? -ne 0 ];then
+            _err_msg_="Could not print demarcation in database"
+            abort_script "${_err_msg_}"
+        fi
+        log_msg -l ${LOGFILE} -t -s "Created first instance of the demarcation on ${HNAME}\n"
+      else
+        log_msg -l ${LOGFILE} -t -s "First instance demarcation already created on ${HNAME}\n"
+      fi
+
+        $ECHO $_date_today_"_demarcation_1" > ${COUNTER_TOOL_DIR}/demarcation_metadata_file 
+
+  else
+    $GREP "${_date_today_}" ${COUNTER_TOOL_DIR}/demarcation_metadata_file >> /dev/null 2>&1
+    if [ $? -eq 0 ];then
+      _demarcation_instance_=`$CAT ${COUNTER_TOOL_DIR}/demarcation_metadata_file | $CUT -d "_" -f3`
+      _demarcation_instance_=`$EXPR $_demarcation_instance_ + 1`
+      $GREP -w "${_date_today_}_demarcation_${_demarcation_instance_}" ${RLL_LOG_FILE} >> /dev/null 2>&1
+      if [ $? -ne 0 ];then 
+          $ECHO "PRINT '$_date_today_"_demarcation_${_demarcation_instance_}"'"> ${_query_file_}
+          $SU - $SYSUSER >> /dev/null  -c "${IQDIR}/bin64/dbisql ${CONN_STR_USER_DBA_RD} '${_query_file_}' 2>&1";
+          if [ $? -ne 0 ];then
+              _err_msg_="Could not print demarcation in database"
+              abort_script "${_err_msg_}"
+          fi
+          log_msg -l ${LOGFILE} -t -s "Created demarcation instance : ${_demarcation_instance_} on ${HNAME}\n"
+      else
+          log_msg -l ${LOGFILE} -t -s "Demarcation instance : ${_demarcation_instance_} already created on ${HNAME}\n"
+      fi
+    else
+        log_msg -l ${LOGFILE} -t -s "Current date and date present in metadata file is different."
+        date_in_metadata=`$CAT ${COUNTER_TOOL_DIR}/demarcation_metadata_file | $CUT -d '_' -f1`
+        _demarcation_instance_=`$CAT ${COUNTER_TOOL_DIR}/demarcation_metadata_file | $CUT -d "_" -f3`
+        _demarcation_instance_=`$EXPR $_demarcation_instance_ + 1`
+        $GREP -w "${date_in_metadata}_demarcation_${_demarcation_instance_}" ${RLL_LOG_FILE} >> /dev/null 2>&1
+        if [ $? -ne 0 ];then 
+            $ECHO "PRINT '${date_in_metadata}"_demarcation_${_demarcation_instance_}"'"> ${_query_file_}
+            $SU - $SYSUSER >> /dev/null  -c "${IQDIR}/bin64/dbisql ${CONN_STR_USER_DBA_RD} '${_query_file_}' 2>&1";
+            if [ $? -ne 0 ];then
+             _err_msg_="Could not print demarcation in database"
+             abort_script "${_err_msg_}"
+            fi
+            log_msg -l ${LOGFILE} -t -s "Created demarcation instance : ${_demarcation_instance_} on ${HNAME}\n"
+        else
+            log_msg -l ${LOGFILE} -t -s "Demarcation instance : ${_demarcation_instance_} already created on ${HNAME}"
+        fi
+    fi
+  fi
+
+}
+
+### Function: create_log_directories ###
+#
+# Create required log directories on NAS location
+#
+# Arguments:
+# Return Values:
+#       none
+create_log_directories()
+{
+log_msg -l ${LOGFILE} -t -s "Creating required log directories on ${HNAME}"
+# Create Counter Tool dir
+if [ ! -d ${COUNTER_TOOL_PARENT_DIR} ]; then
+    $MKDIR -p ${COUNTER_TOOL_PARENT_DIR}
+    $CHOWN ${SYSUSER}:${SYSGROUP} ${COUNTER_TOOL_PARENT_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ownership of ${CLI_IQ_LOG_DIR}/CounterTool to ${SYSUSER}:${SYSGROUP}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+if [ ! -d ${COUNTER_TOOL_DIR} ]; then
+    $MKDIR -p ${COUNTER_TOOL_DIR}
+    $CHOWN ${SYSUSER}:${SYSGROUP} ${COUNTER_TOOL_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ownership of ${COUNTER_TOOL_DIR} to ${SYSUSER}:${SYSGROUP}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Create data_files dir
+if [ ! -d ${COUNTER_TOOL_DIR}/data_files ]; then
+    $MKDIR -p ${COUNTER_TOOL_DIR}/data_files
+    $CHOWN ${SYSUSER}:${SYSGROUP} ${COUNTER_TOOL_DIR}/data_files
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ownership of ${COUNTER_TOOL_DIR}/data_files to ${SYSUSER}:${SYSGROUP}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Create archived_files dir
+if [ ! -d ${COUNTER_TOOL_DIR}/archived_files ]; then
+    $MKDIR -p ${COUNTER_TOOL_DIR}/archived_files
+    $CHOWN ${SYSUSER}:${SYSGROUP} ${COUNTER_TOOL_DIR}/archived_files
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ownership of ${COUNTER_TOOL_DIR}/archived_files to ${SYSUSER}:${SYSGROUP}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Create files_to_parse_L1 dir
+if [ ! -d ${COUNTER_TOOL_DIR}/files_to_parse_L1 ]; then
+    $MKDIR -p ${COUNTER_TOOL_DIR}/files_to_parse_L1
+    $CHOWN ${SYSUSER}:${SYSGROUP} ${COUNTER_TOOL_DIR}/files_to_parse_L1
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ownership of ${COUNTER_TOOL_DIR}/files_to_parse_L1 to ${SYSUSER}:${SYSGROUP}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Create files_to_parse_L2 dir
+if [ ! -d ${COUNTER_TOOL_DIR}/files_to_parse_L2 ]; then
+    $MKDIR -p ${COUNTER_TOOL_DIR}/files_to_parse_L2
+    $CHOWN ${SYSUSER}:${SYSGROUP} ${COUNTER_TOOL_DIR}/files_to_parse_L2
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ownership of ${COUNTER_TOOL_DIR}/files_to_parse_L2 to ${SYSUSER}:${SYSGROUP}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Create aggregated dir
+if [ ! -d ${COUNTER_TOOL_PARENT_DIR}/aggregated ]; then
+    $MKDIR -p ${COUNTER_TOOL_PARENT_DIR}/aggregated
+    $CHOWN ${SYSUSER}:${SYSGROUP} ${COUNTER_TOOL_PARENT_DIR}/aggregated
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ownership of ${COUNTER_TOOL_PARENT_DIR}/aggregated to ${SYSUSER}:${SYSGROUP}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+if [ ! -d $WORK_DIR ]; then
+    $MKDIR -p $WORK_DIR
+    $CHOWN ${SYSUSER}:${SYSGROUP} $WORK_DIR
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ownership of $WORK_DIR to ${SYSUSER}:${SYSGROUP}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+$CHMOD 777 $WORK_DIR
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permission of $WORK_DIR"
+    abort_script "${_err_msg_}"
+fi
+
+
+if [ ! -d ${FAILED_DIR} ]; then
+    $MKDIR -p ${FAILED_DIR}
+    $CHOWN ${SYSUSER}:${SYSGROUP} ${FAILED_DIR}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not change ownership of ${FAILED_DIR} to ${SYSUSER}:${SYSGROUP}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+$CHMOD 777 ${FAILED_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permission of ${FAILED_DIR}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -l ${LOGFILE} -t -s "successfully created required log directories on ${HNAME}"
+}
+
+### Function: disable_request_level_logging ###
+#
+# Disable RLL on each blade
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+disable_request_level_logging()
+{
+if [ -f ${DWH_CONF} ]; then
+    log_msg -l ${LOGFILE} -t -s "Disabling Request Level Logging"
+    # Stop the database services and put engine in NoLoads
+    stop_database_services
+    # Update dwhdb.cfg file to disable RLL
+    update_dwhdb_conf_file_disable
+    # Start the database services and put engine in Normal
+    restore_file_flag=0
+    start_database_services
+    $RM -rf ${COUNTER_TOOL_PARENT_DIR}/.rll_enabled_flag
+    log_msg -l ${LOGFILE} -t -s "Successfully disabled Request Level Logging"
+else
+    _err_msg_="${DWH_CONF} file not present"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: dwhdb_action ###
+#
+# Stops/starts the dwhdb database
+#
+# Arguments:
+#       Yes
+# Return Values:
+#       None
+#
+dwhdb_action()
+{
+_dwhdb_service_name_=$2
+if [ "${_dwhdb_service_name_}" == "eniq-dwhdb" ]; then
+    _dwhdb_service_="dwhdb"
+elif [ "${_dwhdb_service_name_}" == "eniq-dwh_reader" ]; then
+    _dwhdb_service_="dwh_reader"
+fi
+
+# Get current dwhdb status
+_dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+if [ "$_dwhdbstate_" == "" ]; then
+    restore_backup_file
+    revert_eng_profile
+    _err_msg_="Could not get the current state for ${_dwhdb_service_name_} at `$DATE`"
+    abort_script "$_err_msg_"
+fi
+
+#When dwhdb action is start
+if [ "$1" == "start" ]; then
+    if [ "${_dwhdbstate_}" == "inactive" ]; then
+        $BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a start -s ${_dwhdb_service_} -N -l ${LOGFILE}
+        if [ $? -ne 0 ]; then
+            log_msg -l ${LOGFILE} -t -s "Could not start ${_dwhdb_service_}. Checking further\n"
+
+            # Get current dwhdb status
+            _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+
+            if [ "${_dwhdbstate_}" == "activating" ]; then
+                log_msg -l ${LOGFILE} -t -s "Found ${_dwhdb_service_name_} in ${_dwhdbstate_} state during service $1"
+                log_msg -l ${LOGFILE} -t -s "Waiting for 300 seconds before checking the ${_dwhdb_service_name_} state again."
+                $SLEEP 300
+
+                _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+                if [ "${_dwhdbstate_}" == "active" ]; then
+                    log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} has started successfully\n"
+                elif [ "${_dwhdbstate_}" == "failed" ]; then
+                    clear_dwhdb_failed_state "$1" "${_dwhdb_service_}"
+                elif [ "${_dwhdbstate_}" != "failed" -o "${_dwhdbstate_}" != "active" ]; then
+                    restore_backup_file
+                    revert_eng_profile
+                    _err_msg_="${_dwhdb_service_name_} is in ${_dwhdbstate_} state at `$DATE`. Kindly contact Ericsson support\n"
+                    abort_script "$_err_msg_"
+                fi
+            fi
+        else
+            _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+            if [ "${_dwhdbstate_}" == "active" ]; then
+                log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} has started successfully\n"
+            fi
+        fi
+    elif [ "${_dwhdbstate_}" == "activating" ]; then
+        while [ "${_dwhdbstate_}" == "activating" ]
+        do
+            $SLEEP 10
+            _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+        done
+        if [ "${_dwhdbstate_}" == "active" ]; then
+            log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} has started successfully\n"
+        elif [ "${_dwhdbstate_}" == "failed" ]; then
+            clear_dwhdb_failed_state "$1" "${_dwhdb_service_}"
+        elif [ "${_dwhdbstate_}" != "failed" -o "${_dwhdbstate_}" != "active" ]; then
+            restore_backup_file
+            revert_eng_profile
+            _err_msg_="${_dwhdb_service_name_} is in ${_dwhdbstate_} state at `$DATE`. Kindly contact Ericsson support\n"
+            abort_script "$_err_msg_"
+        fi
+    elif [ "${_dwhdbstate_}" == "failed" ]; then
+        clear_dwhdb_failed_state "$1" "${_dwhdb_service_}"
+    elif [ "${_dwhdbstate_}" == "active" ]; then
+        log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} is already active. Proceeding further\n"
+    fi
+
+#When dwhdb action is stop
+elif [ "$1" == "stop" ]; then
+    if [ "${_dwhdbstate_}" == "active" ]; then
+        stop_dwhdb "${_dwhdb_service_}"
+    elif [ "${_dwhdbstate_}" == "activating" ]; then
+        log_msg -l ${LOGFILE} -t -s "Found ${_dwhdb_service_name_} in ${_dwhdbstate_} state during service $1"
+        log_msg -l ${LOGFILE} -t -s "Waiting for 300 seconds before checking the ${_dwhdb_service_name_} state again."
+        $SLEEP 300
+
+        _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+        if [ "${_dwhdbstate_}" == "failed" ]; then
+            clear_dwhdb_failed_state "$1" "${_dwhdb_service_}"
+        elif [ "${_dwhdbstate_}" == "active" ]; then
+            stop_dwhdb "${_dwhdb_service_}"
+        elif [ "${_dwhdbstate_}" != "failed" -o "${_dwhdbstate_}" != "active" ]; then
+            _err_msg_="${_dwhdb_service_name_} is in ${_dwhdbstate_} state at `$DATE`. Kindly contact Ericsson support\n"
+            abort_script "$_err_msg_"
+        fi
+    elif [ "${_dwhdbstate_}" == "failed" ]; then
+        clear_dwhdb_failed_state "$1" "${_dwhdb_service_}"
+    elif [ "$_dwhdbstate_" == "inactive" ]; then
+        log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} is already inactive. Proceeding further"
+    fi
+fi
+}
+
+### Function: enable_request_level_logging ###
+#
+# Enable RLL on each blade
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+enable_request_level_logging()
+{
+if [ -f ${DWH_CONF} ]; then
+    log_msg -l ${LOGFILE} -t -s "Enabling Request Level Logging"
+
+        # Stop the database services and put engine in NoLoads
+        stop_database_services
+        # Update dwhdb.cfg file to enable RLL
+        update_dwhdb_conf_file
+        # Start the database services and put engine in Normal
+        restore_file_flag=0
+        start_database_services
+        $TOUCH ${COUNTER_TOOL_PARENT_DIR}/.rll_enabled_flag
+        log_msg -l ${LOGFILE} -t -s "Successfully enabled Request Level Logging"
+
+else
+    _err_msg_="${DWH_CONF} file not present"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: engine_change ###
+#
+# Checking the engine state and changing it as requested
+#
+# Arguments:
+#       none
+# Return Values:
+#       Changing engine state to NoLoads
+engine_change()
+{
+if [ "$1" == "NoLoads" ] ; then
+    if [ "$_eng_profile_" != "NoLoads" ]; then
+        log_msg -l ${LOGFILE} -t -s "Engine change required."
+        # Change engine Profile to NoLoads on engine server
+        _cmd_4_="$SU - $SYSUSER -c \"engine -e changeProfile 'NoLoads'\""
+        $remote_conn_string $SERVER_IP "${_cmd_4_}" > /dev/null
+        _eng_profile_chk_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK {'print \$3'}")
+
+        while [ "$_eng_profile_chk_" != "NoLoads" ]; do
+            $SLEEP 5
+            _eng_profile_chk_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK {'print \$3'}")
+        done
+
+        # Flag updates when engine state change to NoLoads
+        _engine_change_flag_=1
+        log_msg -l ${LOGFILE} -t -s "Engine profile on server $_engine_ip_ changed from $_eng_profile_ to NoLoads successfully."
+        log_msg -l ${LOGFILE} -t -s "Checking execution slots status"
+
+        # Check for execution slots until empty
+        _cmd_3_="$SU - $SYSUSER -c \"engine -e showSetsInExecutionSlots \"slots\" \"dcuser\"\""
+        exec_count=$($remote_conn_string $SERVER_IP "${_cmd_3_} |$EGREP '(Loader|Count)'| $WC -l")
+
+        while [ $exec_count -ne 0 ]; do
+            log_msg -l ${LOGFILE} -t -q -s "Execution slot on server $_engine_ip_ is not empty, waiting until it gets empty"
+            $SLEEP 30
+            exec_count=$($remote_conn_string $SERVER_IP "${_cmd_3_} |$EGREP '(Loader|Count)'| $WC -l")
+        done
+        log_msg -l ${LOGFILE} -t -s "Execution slot is empty now on server $_engine_ip_.\n"
+    elif [ "$_eng_profile_" == "NoLoads" ]; then
+        log_msg -l ${LOGFILE} -t -s "Engine profile on server $_engine_ip_ is already $_eng_profile_, change not required"
+    fi
+elif [ "$1" == "Normal" ]; then
+    if [ "$_eng_profile_" != "Normal" ]; then
+        log_msg -l ${LOGFILE} -t -s "Reverting engine profile on server to Normal state\n"
+        _cmd_5_="$SU - $SYSUSER -c \"engine -e changeProfile 'Normal'\""
+        $remote_conn_string $SERVER_IP "${_cmd_5_}" > /dev/null
+        if [ $? -eq 0 ]; then
+            _engine_change_flag_=0
+            log_msg -l ${LOGFILE} -t -s "Engine on server $_engine_ip_ is set back to Normal\n"
+        else
+            restore_backup_file
+            _err_msg_="Could not revert engine profile to Normal\n"
+            abort_script "$_err_msg_"
+        fi
+    elif [ "$_eng_profile_" == "Normal" ]; then
+        log_msg -l ${LOGFILE} -t -s "Engine profile on server $_engine_ip_ is already Normal, change not required"
+    fi
+fi
+}
+
+### Function: engine_profile ###
+#
+# Checking the engine state and gives engine current profile
+#
+# Arguments:
+#       none
+# Return Values:
+#       Engine current profile
+engine_profile()
+{
+#Getting current engine profile
+_cmd_2_="$SU - $SYSUSER -c \"engine \"status\" \"dcuser\"\""
+_eng_profile_=$($remote_conn_string $SERVER_IP "${_cmd_2_} | $GREP \"Current Profile: \" | $AWK {'print \$3'}")
+if [ "$_eng_profile_" == "" ]; then
+    _err_msg_="Could not get engine current profile from server $_engine_ip_ at `$DATE`.Restoring services\n"
+    abort_script "$_err_msg_"
+else
+    log_msg -l ${LOGFILE} -t -s "Engine current profile on server $_engine_ip_ is $_eng_profile_"
+fi
+}
+
+
+
+
+### Function: flush_metadata ###
+#
+# Flush metadat file content
+# Runs only at midnight
+# Arguments:
+#   none
+# Return Values:
+#   none
+flush_metadata()
+{
+# create demarcation file last instance at 12
+
+ _query_file_="${TEM_DIR}/queryFile.sql"
+ _date_today_=`date +"%d-%m-%y"`
+ _time_=`date '+%H:%M:%S'`
+ get_config_log_files
+    log_msg -l ${LOGFILE} -t -s "Flushing the Demarcation Metadata File to start from new instance on ${HNAME}"
+    $RM -rf ${COUNTER_TOOL_DIR}/demarcation_metadata_file ${COUNTER_TOOL_DIR}/demarcation_metadata_file_copy
+    _date_today_=`date +"%d-%m-%y"`
+    log_msg -l ${LOGFILE} -t -s "Creating Demarcation for New instance on ${HNAME}"
+    parse_1 
+
+}
+
+
+
+
+### Function: generate_default_user_display_files ###
+#
+# generate default user display files
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+generate_default_user_display_files()
+{
+#MASTER_FILE_AGG=${TEM_DIR}/master_file_for_aggregation.txt
+if [ ! -f "${WORK_DIR}/Interface_and_Techpacks.txt" ];then
+    get_intf_from_repdb
+fi
+
+if [ ! -f "${WORK_DIR}/Techpacks.txt" ];then
+    get_tp_from_repdb
+fi
+
+    # create master file
+    if [ ! -f ${MASTER_FILE} ]; then
+        get_master_list_from_repdb
+    fi
+    $CAT ${MASTER_FILE} > ${MASTER_FILE_AGG}
+
+if [ ! -f "${WORK_DIR}/master_list_with_feature.txt" ];then
+    get_master_file_with_features
+fi
+
+log_msg -l ${LOGFILE} -t -s "Running default statistics collection on ${HNAME} from entire database"
+$SU - ${SYSUSER} -c "bash /eniq/admin/bin/counter_statistics.bsh -d default -c" >> ${LOGFILE}
+if [ $? -eq 0 ];then
+	ls -lrth  ${COUNTER_TOOL_STATISTICS_FILES_DIR}| $GREP -E "dcuser|root" | $TAIL -3| $AWK -F " " '{print $NF}' > ${TEM_DIR}/default_csv_files
+	for csv_file in `$CAT ${TEM_DIR}/default_csv_files`;do
+		$MV ${COUNTER_TOOL_STATISTICS_FILES_DIR}/${csv_file} ${COUNTER_TOOL_STATISTICS_FILES_DIR}/default_${csv_file}
+		if [ $? -ne 0 ]; then
+			_err_msg_="Could not create default user display reports."
+			abort_script "${_err_msg_}"
+		fi
+		log_msg -l ${LOGFILE} -t -s "Created default reports : ${COUNTER_TOOL_STATISTICS_FILES_DIR}/default_${csv_file}"
+	done
+
+fi
+
+
+dateago=`stat ${COUNTER_TOOL_PARENT_DIR}/.rll_enabled_flag | grep 'Access: [[:digit:]]' | cut -d' ' -f2`
+
+dtSec=$(date --date "$dateago" +'%s')
+
+
+
+timeago='30 days ago'
+taSec=$(date --date "$timeago" +'%s')
+if [ $dtSec -lt $taSec ] ;then
+	#greater than 90 days
+	log_msg -l ${LOGFILE} -t -s "Running past 30 days  statistics collection on ${HNAME}"
+	$SU - ${SYSUSER} -c "bash /eniq/admin/bin/counter_statistics.bsh -d 30_days -c" >> ${LOGFILE}
+	if [ $? -eq 0 ];then
+		ls -lrth  ${COUNTER_TOOL_STATISTICS_FILES_DIR}| $GREP -E "dcuser|root" | $TAIL -3 | $AWK -F " " '{print $NF}' > ${TEM_DIR}/default_csv_files
+		for csv_file in `$CAT ${TEM_DIR}/default_csv_files`;do
+			$MV ${COUNTER_TOOL_STATISTICS_FILES_DIR}/${csv_file} ${COUNTER_TOOL_STATISTICS_FILES_DIR}/30_days_${csv_file}
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not create default user display reports for past 30 days."
+				abort_script "${_err_msg_}"
+			fi
+			log_msg -l ${LOGFILE} -t -s "Created default reports : ${COUNTER_TOOL_STATISTICS_FILES_DIR}/30_days_${csv_file}"
+		done
+
+	fi
+fi
+
+timeago='90 days ago'
+taSec=$(date --date "$timeago" +'%s')
+if [ $dtSec -lt $taSec ] ;then
+	#greater than 90 days
+	log_msg -l ${LOGFILE} -t -s "Running past 90 days  statistics collection on ${HNAME}"
+	$SU - ${SYSUSER} -c "bash /eniq/admin/bin/counter_statistics.bsh -d 90_days -c" >> ${LOGFILE}
+	if [ $? -eq 0 ];then
+		ls -lrth  ${COUNTER_TOOL_STATISTICS_FILES_DIR}| $GREP -E "dcuser|root" | $TAIL -3 | $AWK -F " " '{print $NF}' > ${TEM_DIR}/default_csv_files
+		for csv_file in `$CAT ${TEM_DIR}/default_csv_files`;do
+			$MV ${COUNTER_TOOL_STATISTICS_FILES_DIR}/${csv_file} ${COUNTER_TOOL_STATISTICS_FILES_DIR}/90_days_${csv_file}
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not create default user display reports for past 90 days."
+				abort_script "${_err_msg_}"
+			fi
+			log_msg -l ${LOGFILE} -t -s "Created default reports : ${COUNTER_TOOL_STATISTICS_FILES_DIR}/90_days_${csv_file}"
+		done
+
+	fi
+fi
+
+timeago='180 days ago'
+taSec=$(date --date "$timeago" +'%s')
+if [ $dtSec -lt $taSec ] ;then
+	#greater than 180 days
+	log_msg -l ${LOGFILE} -t -s "Running past 180 days  statistics collection on ${HNAME}"
+	$SU - ${SYSUSER} -c "bash /eniq/admin/bin/counter_statistics.bsh -d 180_days -c " >> ${LOGFILE}
+	if [ $? -eq 0 ];then
+		ls -lrth  ${COUNTER_TOOL_STATISTICS_FILES_DIR}| $GREP -E "dcuser|root" | $TAIL -3 | $AWK -F " " '{print $NF}' > ${TEM_DIR}/default_csv_files
+		for csv_file in `$CAT ${TEM_DIR}/default_csv_files`;do
+			$MV ${COUNTER_TOOL_STATISTICS_FILES_DIR}/${csv_file} ${COUNTER_TOOL_STATISTICS_FILES_DIR}/180_days_${csv_file}
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not create default user display reports for past 180 days."
+				abort_script "${_err_msg_}"
+			fi
+			log_msg -l ${LOGFILE} -t -s "Created default reports : ${COUNTER_TOOL_STATISTICS_FILES_DIR}/180_days_${csv_file}"
+		done
+
+	fi
+fi
+
+timeago='1 year ago'
+taSec=$(date --date "$timeago" +'%s')
+if [ $dtSec -lt $taSec ] ;then
+	#greater than 1 year 
+	log_msg -l ${LOGFILE} -t -s "Running past 180 days  statistics collection on ${HNAME}"
+	$SU - ${SYSUSER} -c "bash /eniq/admin/bin/counter_statistics.bsh -d 1_year -c" >> ${LOGFILE}
+	if [ $? -eq 0 ];then
+		ls -lrth  ${COUNTER_TOOL_STATISTICS_FILES_DIR}| $GREP -E "dcuser|root" | $TAIL -3 | $AWK -F " " '{print $NF}' > ${TEM_DIR}/default_csv_files
+		for csv_file in `$CAT ${TEM_DIR}/default_csv_files`;do
+			$MV ${COUNTER_TOOL_STATISTICS_FILES_DIR}/${csv_file} ${COUNTER_TOOL_STATISTICS_FILES_DIR}/1_year_${csv_file}
+			if [ $? -ne 0 ]; then
+				_err_msg_="Could not create default user display reports for past 180 days."
+				abort_script "${_err_msg_}"
+			fi
+			log_msg -l ${LOGFILE} -t -s "Created default reports : ${COUNTER_TOOL_STATISTICS_FILES_DIR}/1_year_${csv_file}"
+		done
+
+	fi
+fi
+
+
+
+
+}
+
+### Function: get_deployment_order ###
+#
+# Get the order of the deployment
+# for performing required functionality based on action type
+#
+# Arguments: none
+#
+# Return Values: none
+get_deployment_order()
+{
+$RM -rf ${TEM_DIR}/server_order_list
+
+# Get an ordered list of servers based on the server_list file
+$PERL ${ENIQ_CORE_INST_DIR}/lib/get_ip_order.pl -f ${TEM_DIR}/server_order_list
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not get an ordered list of servers"
+    abort_script "${_err_msg_}"
+fi
+}
+
+### Function: get_config_log_files ###
+#
+# Get bladewise config and RLL log files
+#
+# Arguments: none
+#
+# Return Values: none
+get_config_log_files()
+{
+if [ "${CO_SERVER}" == "YES" ]; then
+    DWH_CONF="${ENIQ_DATABASE_DIR}/dwh_main/dwhdb.cfg"
+    RLL_LOG_FILE="${COUNTER_TOOL_DIR}/data_files/iqtracedwhdb.log"
+elif [ "${RD_SERVER}" == "YES" ]; then
+    DWH_CONF="${ENIQ_DATABASE_DIR}/dwh_reader/dwhdb.cfg"
+    if [ "${_reader_}" == "dwh_reader_1" ]; then
+        RLL_LOG_FILE="${COUNTER_TOOL_DIR}/data_files/iqtracedwh_reader_1.log"
+    elif [ "${_reader_}" == "dwh_reader_2" ]; then
+        RLL_LOG_FILE="${COUNTER_TOOL_DIR}/data_files/iqtracedwh_reader_2.log"
+    fi
+fi
+}
+
+### Function: get_master_list_from_repdb ###
+#
+# Get master list from repdb
+#
+# Arguments: none
+#
+# Return Values: none
+get_master_list_from_repdb()
+{
+# create master file.. CO and RD handling
+$RM -rf ${TEM_DIR}/DC_DIM_table_counter_info.txt
+$SU - ${SYSUSER} -c "dbisql ${CONN_STR_USER_DBA_REPDB} \"select TYPEID, DATANAME from dwhrep.MeasurementCounter; output to ${TEM_DIR}/DC_DIM_table_counter_info.txt APPEND HEXADECIMAL ASIS FORMAT TEXT DELIMITED BY ' ' QUOTE '' ;\"" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not fetch counter info for all tables from repdb.\n"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${TEM_DIR}/DC_DIM_table_counter_info.txt | $AWK -F ":" '{print $NF}'| $SED 's/ /::/g' > ${TEM_DIR}/master_file_temp_1.txt
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not segregate table and counter from ${TEM_DIR}/DC_DIM_table_counter_info.txt\n"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${TEM_DIR}/master_file_temp_1.txt | $GREP -iv "DIM_\|DC_Z_ALARM\|DC_E_BULK_CM\|LOG_" >> ${MASTER_FILE}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${MASTER_FILE} file\n"
+    abort_script "$_err_msg_"
+fi
+$RM -rf ${TEM_DIR}/DC_DIM_table_counter_info.txt
+}
+
+
+### Function: get_master_file_with_features ###
+#
+# map master file with features
+#
+# Arguments: none
+#
+# Return Values: none
+get_master_file_with_features()
+{
+$RM -rf ${WORK_DIR}/master_list_with_feature.txt
+#$CAT ${MASTER_FILE_USR_DISP}  | awk -F "::" '{print $1}' | $SORT -u > ${TEM_DIR}/master_distinct_tables.txt
+for tp_name in `$CAT ${WORK_DIR}/Techpacks.txt`;do
+    $GREP "^${tp_name}_" ${MASTER_FILE_AGG}  > ${TEM_DIR}/table_based_on_tp.txt
+    if [ $? -eq 0  ];then
+        $RM -rf ${TEM_DIR}/feature.txt
+        $CAT ${WORK_DIR}/Interface_and_Techpacks.txt | $GREP -w ${tp_name} | $AWK -F " " '{print $1}' > ${TEM_DIR}/interfaces
+        
+        #get cxc list from interfaces
+        $GREP -iwf ${TEM_DIR}/interfaces /eniq/sw/conf/feature_techpacks | $AWK -F : '{print $1}' |$SORT -u > ${TEM_DIR}/cxc_number.txt
+        
+        # get feature name from cxc
+        $GREP -iwf ${TEM_DIR}/cxc_number.txt /eniq/sw/conf/feature_descriptions | $AWK -F :: '{print $2}' | $SORT -u > ${TEM_DIR}/feature_list
+        
+        #append feature information with the file
+        feature=`$CAT ${TEM_DIR}/feature_list | $TR '\n' "|" | $SED 's/.$//' `
+        if [ ! -z "${feature}" ];then
+			while read table_details;do
+                    $ECHO $table_details::$feature >> ${WORK_DIR}/master_list_with_feature.txt
+            done < ${TEM_DIR}/table_based_on_tp.txt
+        fi
+    fi
+
+done
+
+
+
+}
+
+
+### Function: get_all_column_list_from_repdb ###
+#
+# Get all columns list from repdb
+#
+# Arguments: none
+#
+# Return Values: none
+get_all_column_list_from_repdb()
+{
+# create master file.. CO and RD handling
+$RM -rf ${TEM_DIR}/DC_DIM_table_columns_info.txt
+$SU - ${SYSUSER} -c "dbisql ${CONN_STR_USER_DBA_REPDB} \"select DATAFORMATID, DATANAME from dwhrep.DataItem ; output to ${TEM_DIR}/DC_DIM_table_columns_info.txt APPEND HEXADECIMAL ASIS FORMAT TEXT DELIMITED BY ' ' QUOTE '' ; \"" >> /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not fetch counter info for all tables from repdb.\n"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${TEM_DIR}/DC_DIM_table_columns_info.txt | $AWK -F'[:, ]' '{print $3"::"$NF}' > ${TEM_DIR}/all_column_file_temp_1.txt
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not segregate table and counter from ${TEM_DIR}/DC_DIM_table_columns_info.txt\n"
+    abort_script "$_err_msg_"
+fi
+
+$CAT ${TEM_DIR}/all_column_file_temp_1.txt | $GREP -iv "DIM_\|DC_Z_ALARM\|DC_E_BULK_CM\|LOG_" >> ${KEY_COLUMN_LIST}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create ${KEY_COLUMN_LIST} file\n"
+    abort_script "$_err_msg_"
+fi
+$RM -rf ${TEM_DIR}/DC_DIM_table_columns_info.txt
+}
+
+
+
+
+### Function: parse_1 ###
+#
+# parse_1 runs every hour 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+parse_1()
+{
+curr_date=`date '+%d-%m-%Y'`
+curr_time=`date '+%H-%M-%S'`
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    create_demarcation_CO 
+elif [ "${RD_SERVER}" == "YES" ]; then
+    create_demarcation_RD
+fi
+$LS ${COUNTER_TOOL_DIR}/data_files | $GREP ".old" > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    _file_to_archive_=`$LS ${COUNTER_TOOL_DIR}/data_files | $GREP ".old"`
+    for _file_ in ${_file_to_archive_}; do
+        _file_name_=`$ECHO ${_file_} | $AWK -F "." '{print $1}'`
+        $MV ${COUNTER_TOOL_DIR}/data_files/${_file_} ${COUNTER_TOOL_DIR}/data_files/${_file_}_${curr_date}_${curr_time}
+        $TAR -czvf "${COUNTER_TOOL_DIR}/archived_files/${_file_name_}_${curr_date}_${curr_time}.tar.gz" -C ${COUNTER_TOOL_DIR}/data_files "${_file_}_${curr_date}_${curr_time}" --remove-files > /dev/null 2>&1
+    done
+fi
+# Call parser
+python ${SCRIPTHOME}/parsing_levels.py "$COUNTER_TOOL_DIR" "${LOGFILE}" "parsing_level_1" "${RLL_LOG_FILE}" "${TEM_DIR}"
+
+
+}
+
+
+### Function: parsing_level_1 ###
+#
+# parsing_level_1 runs every hour 
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+parsing_level_1()
+{
+
+# check if DB is up
+if [ "${CO_SERVER}" == "YES" ]; then
+    check_server_running dwhdb
+elif [ "${RD_SERVER}" == "YES" ]; then
+    if [ -f ${ENIQ_CONF_DIR}/install_reader_type ]; then
+        _reader_=`$CAT ${ENIQ_CONF_DIR}/install_reader_type | $GREP "dwh_reader"`
+        check_server_running ${_reader_}
+    else
+        _err_msg_="Could not find the file ${ENIQ_CONF_DIR}/install_reader_type on ${HNAME}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+if [ ${SERVER_STATUS} -eq 0 ]; then
+        log_msg -t -s "Database is not running, hence not proceeding with the parsing." -l ${LOGFILE}
+        exit 1
+fi
+
+curr_date=`date '+%d-%m-%Y'`
+curr_time=`date '+%H-%M-%S'`
+get_config_log_files
+
+
+_query_file_="${TEM_DIR}/queryFile.sql"
+_date_today_=`date +"%d-%m-%y"`
+_time_=`date '+%H:%M'`
+
+    
+if [ ! -f /var/tmp/parse_tmp/first_occurance_instance_one ];then
+    $LS -larth ${COUNTER_TOOL_DIR}/files_to_parse_L1/  | $GREP -w  log_0 > /dev/null 2>&1
+     if [ $? -ne 0 ];then
+        log_msg -l ${LOGFILE} -t -s "Running parsing for 0 th instance."
+        flush_metadata
+        if [ ! -f /var/tmp/parse_tmp/first_occurance_instance_one ];then
+            $TOUCH /var/tmp/parse_tmp/first_occurance_instance_one
+        fi
+    else
+        $MKDIR -p /var/tmp/parse_tmp/
+        $TOUCH /var/tmp/parse_tmp/first_occurance_instance_one
+        log_msg -l ${LOGFILE} -t -s "0 instance file present on ${HNAME}. Proceeding with parsing."
+        parse_1
+     fi
+else
+
+    if [ "${_time_}" != "00:00" ];then
+        log_msg -l ${LOGFILE} -t -s "Creating demarcation on ${HNAME}"
+        parse_1
+    else
+        #flush_metadata
+        _date_today_=$(date '+%d-%m-%y' -d '-1 day')
+        log_msg -l ${LOGFILE} -t -s "Parsing data for Last instance of the day on ${HNAME}"
+        parse_1
+        log_msg -l ${LOGFILE} -t -s "Flushing the Demarcation Metadata File to start from new instance on ${HNAME}"
+        $RM -rf ${COUNTER_TOOL_DIR}/demarcation_metadata_file ${COUNTER_TOOL_DIR}/demarcation_metadata_file_copy
+        _date_today_=`date +"%d-%m-%y"`
+        log_msg -l ${LOGFILE} -t -s "Creating Demarcation for New instance on ${HNAME}"
+        parse_1
+    fi
+    
+fi
+
+$GREP "ERROR" ${LOGFILE}  > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    flush_metadata
+fi
+}
+
+### Function: parsing_level_2 ###
+#
+# It runs every 1 hr to parse files 
+# generated from parsing_level_1
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+parsing_level_2()
+{
+# create master file
+if [ ! -f ${MASTER_FILE} ]; then
+    get_master_list_from_repdb
+fi
+
+$CP -pr ${MASTER_FILE} ${TEM_DIR}/master_file_for_counters_info_final.txt
+
+if [ ! -f ${KEY_COLUMN_LIST} ]; then
+    get_all_column_list_from_repdb
+fi
+
+$CP -pr ${KEY_COLUMN_LIST} ${TEM_DIR}/key_column_file_for_counters_info_final.txt
+
+# get distinct counter info
+$CAT ${TEM_DIR}/master_file_for_counters_info_final.txt | $AWK -F "::" '{print $2}' | $SORT -u > ${TEM_DIR}/all_counters.txt
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not fetch uniq counter names from ${MASTER_FILE}\n"
+    abort_script "$_err_msg_"
+fi
+
+
+# get distinct counter info
+$CAT ${TEM_DIR}/key_column_file_for_counters_info_final.txt | $AWK -F "::" '{print $2}' | $SORT -u > ${TEM_DIR}/all_columns.txt
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not fetch uniq counter names from ${KEY_COLUMN_LIST}\n"
+    abort_script "$_err_msg_"
+fi
+
+table_list="${COUNTER_TOOL_PARENT_DIR}/tables_to_be_considered.txt"
+
+if [ ! -f ${table_list} ]; then
+    $ECHO "dc_" >> ${table_list}
+    $ECHO "pm_" >> ${table_list}
+fi
+
+$MKDIR -p ${WORK_DIR}/level_2_input_files
+$CHOWN ${SYSUSER}:${SYSGROUP} ${WORK_DIR}/level_2_input_files
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change ownership of ${WORK_DIR}/level_2_input_files to ${SYSUSER}:${SYSGROUP}"
+    abort_script "${_err_msg_}"
+fi
+
+$MKDIR -p ${WORK_DIR}/parallel_threads
+$CHOWN ${SYSUSER}:${SYSGROUP} ${WORK_DIR}/parallel_threads
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change ownership of ${WORK_DIR}/parallel_threads to ${SYSUSER}:${SYSGROUP}"
+    abort_script "${_err_msg_}"
+fi
+
+$MKDIR -p ${WORK_DIR}/level_2_output_files
+$CHOWN ${SYSUSER}:${SYSGROUP} ${WORK_DIR}/level_2_output_files
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change ownership of ${WORK_DIR}/level_2_output_files to ${SYSUSER}:${SYSGROUP}"
+    abort_script "${_err_msg_}"
+fi
+
+$MKDIR -p ${WORK_DIR}/logfiles
+$CHOWN ${SYSUSER}:${SYSGROUP} ${WORK_DIR}/logfiles
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change ownership of ${WORK_DIR}/logfiles to ${SYSUSER}:${SYSGROUP}"
+    abort_script "${_err_msg_}"
+fi
+
+if [ -f ${COUNTER_TOOL_CONFIG_FILE_MULTI_THREAD} ]; then
+    max_threads=`$CAT ${COUNTER_TOOL_CONFIG_FILE_MULTI_THREAD} | $GREP -iw "no_of_threads" | $AWK -F "=" '{print $2}'`
+    max_rows=`$CAT ${COUNTER_TOOL_CONFIG_FILE_MULTI_THREAD} | $GREP -iw "no_of_rows_per_file" | $AWK -F "=" '{print $2}'`
+fi
+
+log_msg -l ${LOGFILE} -s "${yellow}******************** $($DATE '+%d-%m-%Y_%H:%M:%S') : Entering Parsing Level 2 ********************${reset}"
+if [ -f ${TEM_DIR}/parse_1_output ]; then
+    input_parsed_1_file=`$CAT ${TEM_DIR}/parse_1_output`
+    log_msg -l ${LOGFILE} -t -s "Fetching 'select' queries from ${input_parsed_1_file}"
+    $CAT ${input_parsed_1_file} | $GREP -i "select" | $GREP -iv "insert into\|log_\|delete from\|update" | $GREP -i "dc_\|pm_" > ${TEM_DIR}/modified_input_parsed_1_file
+    while [ -s ${TEM_DIR}/modified_input_parsed_1_file ]; do
+        _count_=`$CAT ${TEM_DIR}/modified_input_parsed_1_file | wc -l`
+        if [ ${_count_} -ge ${max_rows} ]; then
+            $HEAD -n ${max_rows} ${TEM_DIR}/modified_input_parsed_1_file > ${WORK_DIR}/level_2_input_files/$($DATE '+%d-%m-%Y_%H:%M:%S')_input_file
+            $SED -i "1,${max_rows} d" ${TEM_DIR}/modified_input_parsed_1_file
+            sleep 1
+        else
+            $CAT ${TEM_DIR}/modified_input_parsed_1_file > ${WORK_DIR}/level_2_input_files/$($DATE '+%d-%m-%Y_%H:%M:%S')_input_file
+            $SED -i '/^/d' ${TEM_DIR}/modified_input_parsed_1_file
+            sleep 1
+        fi
+    done
+    pthread_cnt=1
+    for input_file in `$LS ${WORK_DIR}/level_2_input_files | $SORT`; do
+        Pruns=0
+        while [ 1 = 1 ]
+        do
+            Pruns=`$LS ${WORK_DIR}/parallel_threads | $WC -l`
+            if [ "$Pruns" -lt ${max_threads} ]; then
+                temp_logfiles=${WORK_DIR}/logfiles/$($DATE '+%d-%m-%Y_%H:%M:%S')_logfile
+                log_msg -l ${temp_logfiles} -s "${cyan}------------------ Parsing Level 2 : Thread ${pthread_cnt} ------------------${reset}"
+                python ${SCRIPTHOME}/parsing_levels.py "${WORK_DIR}/level_2_output_files" "${temp_logfiles}" "parsing_level_2" "${WORK_DIR}/level_2_input_files/${input_file}" "${TEM_DIR}" &
+                pthread_cnt=`$EXPR ${pthread_cnt} + 1`
+                $SLEEP 5
+                break
+            else
+                $SLEEP 5
+            fi
+        done
+    done
+
+    while [ 1 = 1 ]
+    do
+        Pruns=`$LS ${WORK_DIR}/parallel_threads | $WC -l`
+        if [ "$Pruns" -eq 0 ];  then
+            break
+        else
+            $SLEEP 5
+        fi
+    done
+    
+    #Consolidate the output files
+    op_files_count=`$LS ${WORK_DIR}/level_2_output_files | wc -l`
+    if [ ${op_files_count} -gt 0 ]; then
+        parsing_level2_output_file=${COUNTER_TOOL_DIR}/files_to_parse_L2/$($DATE '+%d-%m-%Y_%H:%M:%S')_Parse_Level2.log
+        echo $parsing_level2_output_file
+        for output_file in `$LS ${WORK_DIR}/level_2_output_files | $SORT`; do
+            $CAT ${WORK_DIR}/level_2_output_files/${output_file} >> ${parsing_level2_output_file}
+        done
+    fi
+
+    for _logfiles_ in `$LS ${WORK_DIR}/logfiles | $SORT`; do
+        $CAT ${WORK_DIR}/logfiles/${_logfiles_} >> ${LOGFILE}
+    done
+
+    $GREP "Failed to parse few queries\|Issue encountered" ${LOGFILE} > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        clean_parsing_2_files
+        if [ ! -s ${WORK_DIR}/query_breakdown.txt ]; then
+            $RM -rf ${WORK_DIR}/query_breakdown.txt
+        fi
+        _err_msg_="\nCould not perform Parsing Level 2 on ${input_parsed_1_file} successfully. Failed queries will be picked up in next run."
+        abort_script "$_err_msg_"
+    fi
+    if [ -s ${parsing_level2_output_file} ]; then
+        log_msg -l ${LOGFILE} -t -s "Parsing Level 2 completed successfully. Please find the tables and pm counters details in ${parsing_level2_output_file}"
+    else
+        log_msg -l ${LOGFILE} -t -s "Parsing Level 2 completed successfully. No reporting select query found"
+    fi
+    clean_parsing_2_files
+else
+    clean_parsing_2_files
+    log_msg -l ${LOGFILE} -t -s "Output file from parsing level 1 not found. No need to run parsing level 2.\n"
+fi
+}
+
+### Function: parsing_level_3 ###
+#
+# Aggregated data per day along with count of used counters
+# to load data into the database.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+parsing_level_3()
+{
+MASTER_FILE_AGG=${TEM_DIR}/master_file_for_aggregation.txt
+if [ ! -d /eniq/backup/ddc_aggregated ]; then
+    $MKDIR -p /eniq/backup/ddc_aggregated
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    curr_date=`date '+%d-%m-%Y'`
+    date_to_find_1=`date -d "yesterday 13:00" '+%d-%m-%Y'`
+
+    # create master file
+    if [ ! -f ${MASTER_FILE} ]; then
+        get_master_list_from_repdb
+    fi
+    $CAT ${MASTER_FILE} > ${MASTER_FILE_AGG}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not create ${MASTER_FILE_AGG} file"
+        abort_script "${_err_msg_}"
+    fi
+
+    if [ -f ${COUNTER_TOOL_PARENT_DIR}/date_to_aggregate.txt ]; then
+        $GREP -w ${date_to_find_1} ${COUNTER_TOOL_PARENT_DIR}/date_to_aggregate.txt >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            $ECHO "${date_to_find_1}" >> ${COUNTER_TOOL_PARENT_DIR}/date_to_aggregate.txt
+        fi 
+    else
+        $ECHO "${date_to_find_1}" >> ${COUNTER_TOOL_PARENT_DIR}/date_to_aggregate.txt
+    fi
+
+    get_deployment_order
+    for _line_ in `$CAT ${TEM_DIR}/server_order_list`; do
+        _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+        _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+        if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" ]; then
+            _err_msg_="Could not read required info from ${TEM_DIR}/server_order_list"
+            abort_script "${_err_msg_}"
+        fi
+        if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+            create_aggregated_data_file
+        else
+            run_remote_cmd "${_ip_address_}" "$BASH ${SCRIPTHOME}/counter_statistics_tool.bsh -a aggregation" "$LOGFILE"
+            if [ $? -ne 0 ]; then
+                _err_msg_="Failed to execute aggregation on ${_serv_hostname_}"
+                abort_script "${_err_msg_}"
+            fi
+        fi
+    done
+
+    # Update the cosolidated count into database table
+    update_Aggregation_Count_History_table
+
+
+	generate_default_user_display_files
+	
+    $RM -rf ${MASTER_FILE_AGG}
+    $RM -rf ${COUNTER_TOOL_PARENT_DIR}/.failed_aggregation_flag.txt
+elif [ "${RD_SERVER}" == "YES" ]; then
+    create_aggregated_data_file
+fi
+}
+
+### Function: remove_cron_entry ###
+#
+# Removes master cron entry from crontab
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+remove_cron_entry()
+{
+$CAT ${CRON_FILE} | $GREP -w "${ENIQ_ADMIN_BIN_DIR}/counter_tool_master_cron.bsh" >> /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    $SED -i '/counter_tool_master_cron.bsh/d' ${CRON_FILE}
+    $CAT ${CRON_FILE} | $GREP -w "${ENIQ_ADMIN_BIN_DIR}/counter_tool_master_cron.bsh" >> /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log_msg -l ${LOGFILE} -t -s "master cron entry for counter statistics tool has been removed successfully from crontab"
+    else
+        _err_msg_="Failed to remove master cron entry for counter statistics tool from crontab\n"
+        abort_script "$_err_msg_"
+    fi
+else
+    log_msg -l ${LOGFILE} -t -s "Skipping.....master cron entry already removed from the crontab"
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    ddc_cron_file="/opt/ericsson/ERICddc/monitor/appl/ENIQ/accessedCounterDataCollection.bsh"
+    $CAT ${CRON_FILE} | $GREP -w "${ddc_cron_file}" >> /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        $SED -i '/accessedCounterDataCollection.bsh/d' ${CRON_FILE}
+        $CAT ${CRON_FILE} | $GREP -w "${ddc_cron_file}" >> /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            log_msg -l ${LOGFILE} -t -q -s "DDC cron entry for counter statistics tool has been removed successfully from crontab"
+        else
+            _err_msg_="Failed to remove DDC cron entry for counter statistics tool from crontab\n"
+            abort_script "$_err_msg_"
+        fi
+    else
+        log_msg -l ${LOGFILE} -t -q -s "Skipping.....DDC cron entry already removed from the crontab"
+    fi
+fi
+}
+
+### Function: restore_backup_file ###
+#
+# Restoring the backup of .ini file
+#
+# Arguments:
+#       none
+# Return Values:
+#       Restoring .ini file
+restore_backup_file()
+{
+if [ ${restore_file_flag} -eq 0 ]; then
+    $MV ${DWH_CONF}_ctlorg ${DWH_CONF}
+    if [ $? -ne 0 ]; then
+        _err_msg_="Could not restore ${DWH_CONF} file"
+        abort_script "${_err_msg_}"
+    fi
+    restore_file_flag=1
+fi
+}
+
+### Function: revert_eng_profile ###
+#
+# Reverting engine back to it's previous profile
+#
+# Arguments:
+#       Yes
+# Return Values:
+#       None
+#
+revert_eng_profile()
+{
+if [ ${_engine_status_change_} -eq 1 -a ${_engine_change_flag_} -eq 1 ]; then
+    # Setting Engine back to $eng_profile state
+    $SLEEP 10
+    engine_profile
+    engine_change "Normal"
+fi
+}
+
+### Function: setup_env ###
+#
+# Set up environment variables for script.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+setup_env()
+{
+# ENIQ Directories
+if [ ! "${ENIQ_BASE_DIR}" ]; then
+    # Directory on the root filesystem
+    ENIQ_BASE_DIR=/eniq
+fi
+
+ENIQ_ADMIN_DIR=${ENIQ_BASE_DIR}/admin
+ENIQ_DATABASE_DIR=${ENIQ_BASE_DIR}/database
+ENIQ_INST_DIR=${ENIQ_BASE_DIR}/installation
+ENIQ_CORE_INST_DIR=${ENIQ_INST_DIR}/core_install
+ENIQ_LOG_DIR=${ENIQ_BASE_DIR}/local_logs
+ENIQ_CONF_DIR=${ENIQ_INST_DIR}/config
+
+# Admin bin dir
+ENIQ_ADMIN_BIN_DIR=${ENIQ_ADMIN_DIR}/bin
+
+# ENIQ Core install script
+ENIQ_CORE_INST_SCRIPT=${ENIQ_CORE_INST_DIR}/bin/eniq_core_install.bsh
+
+# ENIQ SW conf directory
+CLI_CONF_DIR=${ENIQ_BASE_DIR}/sw/conf
+
+# ENIQ SW log directory
+CLI_IQ_LOG_DIR=${ENIQ_BASE_DIR}/log/sw_log/iq
+
+
+
+# VAR TMP directory
+VAR_TEMP=/var/tmp
+
+#root cron file
+CRON_FILE=/var/spool/cron/root
+
+# Create a temporary Directory
+TEM_DIR=/tmp/counter_tool.$$.$$
+$RM -rf ${TEM_DIR}
+$MKDIR -p ${TEM_DIR}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not create directory ${TEM_DIR}"
+    abort_script "${_err_msg_}"
+fi
+$CHMOD 777 $TEM_DIR
+
+# Remote connection string used while running commands remotely
+remote_conn_string="$SSH -o StrictHostKeyChecking=no -o BatchMode=yes -q -l root"
+
+# Work Directories
+COUNTER_TOOL_PARENT_DIR=${CLI_IQ_LOG_DIR}/CounterTool
+COUNTER_TOOL_REPORT_DIR=${COUNTER_TOOL_PARENT_DIR}/Report
+COUNTER_TOOL_STATISTICS_FILES_DIR=${COUNTER_TOOL_PARENT_DIR}/Statistics
+COUNTER_TOOL_CO_DIR=${COUNTER_TOOL_PARENT_DIR}/CO
+COUNTER_TOOL_RD1_DIR=${COUNTER_TOOL_PARENT_DIR}/RD1
+COUNTER_TOOL_RD2_DIR=${COUNTER_TOOL_PARENT_DIR}/RD2
+
+# Configuration File
+COUNTER_TOOL_CONFIG_FILE=${ENIQ_CONF_DIR}/counter_statistics_tool.cfg
+
+# Configuration File for multi threading
+COUNTER_TOOL_CONFIG_FILE_MULTI_THREAD=${ENIQ_CONF_DIR}/counter_statistics_tool_multi_threading.cfg
+
+WORK_DIR="${COUNTER_TOOL_PARENT_DIR}/working_directory"
+
+FAILED_DIR="${COUNTER_TOOL_PARENT_DIR}/failed_queries"
+
+# Master File
+MASTER_FILE=${WORK_DIR}/master_file_for_counters_info_final.txt
+
+# Non-counter file
+KEY_COLUMN_LIST=${WORK_DIR}/key_column_file_for_counters_info_final.txt
+
+# Hostname Information
+HNAME=`${MYHOSTNAME}`
+HOST_IP=`$GETENT hosts ${HNAME} | $AWK '{print $1}' | $HEAD -1`
+CO_IP_ADDRESS=`$GREP dwhdb /etc/hosts | $AWK '{print $1}'| $SORT -u`
+
+# Get current server type
+CURR_SERVER_TYPE=`$CAT ${ENIQ_CONF_DIR}/installed_server_type | $EGREP -v  '^[[:blank:]]*#' | $SED -e 's/ //g'`
+if [ ! "${CURR_SERVER_TYPE}" ]; then
+    _err_msg_="Could not determine which server type this is"
+    abort_script "${_err_msg_}"
+fi
+
+if [ "${CURR_SERVER_TYPE}" == "stats_engine" ]; then
+    exit 0
+fi
+
+# Check if server is Coordinator or Reader type
+CO_SERVER=""
+RD_SERVER=""
+if [ "${CURR_SERVER_TYPE}" == "stats_coordinator" -o "${CURR_SERVER_TYPE}" == "eniq_stats" ]; then
+    CO_SERVER="YES"
+elif [ "${CURR_SERVER_TYPE}" == "stats_iqr" ]; then
+    RD_SERVER="YES"
+fi
+
+# Source the common functions
+_common_functions_list_="common_functions.lib common_core_install_functions.lib common_migration_functions.lib"
+for lib_file in ${_common_functions_list_}; do
+    if [ -s ${ENIQ_CORE_INST_DIR}/lib/${lib_file} ]; then
+        . ${ENIQ_CORE_INST_DIR}/lib/${lib_file}
+    else
+        _err_msg_="File ${ENIQ_CORE_INST_DIR}/lib/${lib_file} not found"
+        abort_script "${_err_msg_}"
+    fi
+done
+
+SYSUSER=`iniget ENIQ_INSTALL_CONFIG -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v ENIQ_SYSUSER`
+if [ ! "${SYSUSER}" ]; then
+    _err_msg_="Could not read System User from  ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "${_err_msg_}"
+fi
+
+SYSGROUP=`iniget SunOS_GROUP_1 -f ${ENIQ_CONF_DIR}/${SUNOS_INI} -v name`
+if [ ! "${SYSGROUP}" ]; then
+    _err_msg_="Could not read SYSGROUP param from ${ENIQ_CONF_DIR}/${SUNOS_INI}"
+    abort_script "$_err_msg_"
+fi
+
+# Set the Connect DB parameters
+DWH_PORT=`iniget DWH -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+DWH_ENG=`iniget DWH -v ServerName -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+if [ ! "${DWH_PORT}" -o ! "${DWH_ENG}" ]; then
+        _err_msg_="Could not read DWH_PORT and DWH_ENG values from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}"
+fi
+
+if [ "${RD_SERVER}" == "YES" ]; then
+    DWH_READER_PORT=`iniget DWH_READER_SETTINGS -v PortNumber -f ${CLI_CONF_DIR}/${ENIQ_INI}`
+    if [ ! "${DWH_READER_PORT}" ]; then
+        _err_msg_="Could not read DWH_READER_PORT value from ${CLI_CONF_DIR}/${ENIQ_INI}"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+# Get the required environment variables for Sybase
+$SU - ${SYSUSER} -c "$ENV |$EGREP '^(SYBASE|ASDIR|IQDIR|SQLANY)'" > $TEM_DIR/sybase_det.$$
+$CAT $TEM_DIR/sybase_det.$$ |$EGREP '^(SYBASE|ASDIR|IQDIR|SQLANY)' > $TEM_DIR/sybase_det_var.$$
+. $TEM_DIR/sybase_det_var.$$ >> /dev/null 2>&1
+
+if [ -z "$IQDIR" ] ; then
+    _err_msg_="ERROR: IQDIR is not set"
+    abort_script "${_err_msg_}"
+fi
+
+
+
+DBA_PASSWORD=`inigetpassword DB -f ${CLI_CONF_DIR}/${ENIQ_INI} -v DBAPassword`
+if [ ! "${DBA_PASSWORD}" ]; then
+    if [ -f ${ENIQ_BASE_DIR}/sw/installer/dbusers ]; then
+        DBA_PASSWORD=`${ENIQ_BASE_DIR}/sw/installer/dbusers dba dwhrep`
+        if [ ! "${DBA_PASSWORD}" ] ; then
+            _err_msg_="Could not get dwhdb DBA Password"
+            abort_script "${_err_msg_}"
+        fi
+    else
+        err_msg_="Could not get dwhdb DBA Password"
+        abort_script "${_err_msg_}"
+    fi
+fi
+
+
+
+# based on the encrypted function pick the connection string
+
+declare -f get_encrypt_file > /dev/null
+if [ $? -eq 0 ];then
+
+    # removing old connection strings
+    $RM -rf ${TEM_DIR}/conn_str_encrypt.txt.*
+    CONN_STR_USER_DBA="-nogui -onerror exit -c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+    
+    DWH_CONN_STR_USER_DBA_ENC=${TEM_DIR}/conn_str_encrypt.txt.$$
+    
+    # get the encrypted connection string.
+    get_encrypt_file "${CONN_STR_USER_DBA}" "${DWH_CONN_STR_USER_DBA_ENC}"
+    
+    #assign encrypted variable to the new variable
+    CONN_STR_USER_DBA=@$DWH_CONN_STR_USER_DBA_ENC
+    
+
+    # removing the old conection strings for repdb
+    $RM -rf ${TEM_DIR}/con_str_encrypt.*
+    
+    #Initialising the connection string for repdb
+    CONN_STR_USER_DBA_REPDB="-nogui -onerror exit -c \"eng=repdb;links=tcpip{host=repdb;port=2641};uid=dba;pwd=${DBA_PASSWORD}\""
+    CONN_STR_USER_DBA_REPDB_ENC=${TEM_DIR}/con_str_encrypt.$$
+
+    # get the encrypted connection string.
+    get_encrypt_file "${CONN_STR_USER_DBA_REPDB}" "${CONN_STR_USER_DBA_REPDB_ENC}"
+    CONN_STR_USER_DBA_REPDB=@$CONN_STR_USER_DBA_REPDB_ENC
+
+    if [ "${RD_SERVER}" == "YES" ]; then
+        if [ -f ${ENIQ_CONF_DIR}/install_reader_type ]; then
+            _reader_=`$CAT ${ENIQ_CONF_DIR}/install_reader_type | $GREP "dwh_reader"`
+        else
+            _err_msg_="Could not find the file ${ENIQ_CONF_DIR}/install_reader_type on ${HNAME}"
+            abort_script "${_err_msg_}"
+        fi
+        # removing the old conection strings for repdb
+        $RM -rf ${TEM_DIR}/rd_con_str_encrypt.*
+        CONN_STR_USER_DBA_RD_ENC=${TEM_DIR}/rd_con_str_encrypt.$$
+    
+        CONN_STR_USER_DBA_RD="-nogui -onerror exit -c \"uid=dba;pwd=${DBA_PASSWORD};eng=${_reader_};links=tcpip{host=${_reader_};port=${DWH_READER_PORT};dobroadcast=no;verify=no}\""
+
+        # get the encrypted connection string.
+        get_encrypt_file "${CONN_STR_USER_DBA_RD}" "${CONN_STR_USER_DBA_RD_ENC}"
+        CONN_STR_USER_DBA_RD=@$CONN_STR_USER_DBA_RD_ENC
+        
+    fi
+
+else
+
+    CONN_STR_USER_DBA="-nogui -onerror exit -c \"uid=dba;pwd=${DBA_PASSWORD};eng=${DWH_ENG};links=tcpip{host=${DWH_ENG};port=${DWH_PORT};dobroadcast=no;verify=no}\""
+    
+    
+    if [ "${RD_SERVER}" == "YES" ]; then
+        if [ -f ${ENIQ_CONF_DIR}/install_reader_type ]; then
+            _reader_=`$CAT ${ENIQ_CONF_DIR}/install_reader_type | $GREP "dwh_reader"`
+        else
+            _err_msg_="Could not find the file ${ENIQ_CONF_DIR}/install_reader_type on ${HNAME}"
+            abort_script "${_err_msg_}"
+        fi
+        CONN_STR_USER_DBA_RD="-nogui -onerror exit -c \"uid=dba;pwd=${DBA_PASSWORD};eng=${_reader_};links=tcpip{host=${_reader_};port=${DWH_READER_PORT};dobroadcast=no;verify=no}\""
+    fi
+    
+    #Initialising the connection string for repdb
+    CONN_STR_USER_DBA_REPDB="-nogui -onerror exit -c \"eng=repdb;links=tcpip{host=repdb;port=2641};uid=dba;pwd=${DBA_PASSWORD}\""
+
+fi
+
+# Log file
+if [ ! "${LOGFILE}" ]; then
+    $MKDIR -p ${ENIQ_LOG_DIR}/counter_tool
+    LOGFILE="${ENIQ_LOG_DIR}/counter_tool/counter_statistics_tool_${ACTION_TYPE}_${RUN_TIME}.log"
+fi
+
+$TOUCH $LOGFILE
+if [ ! -f $LOGFILE ]; then
+    _err_msg_="Failed to create $LOGFILE"
+    abort_script "${_err_msg_}"
+fi
+
+$CHMOD 777 $LOGFILE
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not change the permission of $LOGFILE"
+    abort_script "${_err_msg_}"
+fi
+
+$ECHO "RAW
+DAYBH
+DAY
+RANKBH
+COUNT
+DELTA
+PREV
+PLAIN" > ${TEM_DIR}/table_extensions.txt
+}
+
+### Function: start_database_services ###
+#
+# Starts the database services and put engine in Normal
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+#
+start_database_services()
+{
+if [ -f ${VAR_TEMP}/ct_service_stop_flag ]; then
+    if [ "${CO_SERVER}" == "YES" ]; then
+        # Stop DWHDB before updating niq.ini
+        dwhdb_action start "eniq-dwhdb"
+    elif [ "${RD_SERVER}" == "YES" ]; then
+               $SU - ${SYSUSER} -c "${IQDIR}/bin64/dbping -q -c \"con=$DWH_ENG;eng=$DWH_ENG;links=tcpip{host=$DWH_ENG;port=${DWH_PORT};dobroadcast=none;verify=no};uid=dba;pwd=${DBA_PASSWORD}\"" >> ${LOGFILE} 2>&1
+            if [ $? -eq 0 ]; then
+                log_msg -t -l ${LOGFILE} -s "Database $DWH_ENG is up and running, we can start eniq-dwh_reader service on reader blade"
+            else
+
+                restore_backup_file
+                revert_eng_profile
+                _err_msg_="Database $DWH_ENG is not up and running, we can't start eniq-dwh_reader service on reader blade. Please check eniq-dwhdb service on Coordinator."
+                abort_script "${_err_msg_}"
+            fi
+
+        dwhdb_action start "eniq-dwh_reader"
+    fi
+    $RM -rf ${VAR_TEMP}/ct_service_stop_flag
+fi
+
+if [ ${_engine_status_change_} -eq 1 -a ${_engine_change_flag_} -eq 1 ]; then
+    # Set engine status to Normal
+    engine_profile
+    engine_change "Normal"
+fi
+}
+
+### Function: stop_database_services ###
+#
+# Stops the database services and put engine in NoLoads
+#
+# Arguments:
+#       None
+# Return Values:
+#       None
+#
+stop_database_services()
+{
+_engine_status_change_=0
+_engine_change_flag_=0
+_cmd_1_="$SYSTEMCTL show -p ActiveState eniq-engine |$CUT -d= -f2"
+_engine_ip_=`$CAT /etc/hosts | $GREP engine | $AWK {'print $1'}|$HEAD -1`
+SERVER_IP="$_engine_ip_"
+_engine_status_=$($remote_conn_string ${_engine_ip_} "${_cmd_1_}")
+if [ "${_engine_status_}" == "active" ]; then
+    _engine_status_change_=1
+    engine_profile
+    # Set engine status to NoLoads.
+    engine_change "NoLoads"
+fi
+
+if [ "${CO_SERVER}" == "YES" ]; then
+    # Stop DWHDB before updating niq.ini
+    dwhdb_action stop "eniq-dwhdb"
+elif [ "${RD_SERVER}" == "YES" ]; then
+    dwhdb_action stop "eniq-dwh_reader"
+fi
+}
+
+### Function: stop_dwhdb ###
+#
+# Stops the dwhdb database if service state is active
+#
+# Arguments:
+#       $1 : service name
+# Return Values:
+#       None
+#
+stop_dwhdb()
+{
+_service_name_=$1
+$BASH ${ENIQ_ADMIN_BIN_DIR}/manage_eniq_services.bsh -a stop -s ${_service_name_} -N -l ${LOGFILE}
+_dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+if [ "${_dwhdbstate_}" == "inactive" ]; then
+        log_msg -l ${LOGFILE} -t -s "${_dwhdb_service_name_} stopped successfully\n" 
+elif [ "${_dwhdbstate_}" == "failed" ]; then
+        clear_dwhdb_failed_state "$1" "${_service_name_}"
+fi
+$TOUCH ${VAR_TEMP}/ct_service_stop_flag
+}
+
+### Function: update_Aggregation_Count_History_table ###
+#
+# to load aggregated data into the database.
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_Aggregation_Count_History_table()
+{
+#SqlFile=`mktemp -t Load_aggregated_statistics.XXXXXXXXXX`
+
+
+$SU - $SYSUSER >> /dev/null  -c "${IQDIR}/bin64/dbisql ${CONN_STR_USER_DBA} -q \"${ENIQ_ADMIN_DIR}/sql/create_aggregation_count_history.sql\" 2>&1";
+if [ $? -ne 0 ] ; then
+    _err_msg_="Aggregation_Count_History table creation failed"
+    abort_script "$_err_msg_"
+fi
+
+
+for date_to_find in `$CAT ${COUNTER_TOOL_PARENT_DIR}/date_to_aggregate.txt | $SORT -u`; do
+    aggregated_file=`$FIND ${COUNTER_TOOL_PARENT_DIR}/aggregated/ | $GREP $date_to_find`
+    if [ ! -z ${aggregated_file} ]; then
+        # #updating values in the table.
+		log_msg -l ${LOGFILE} -t -s "Updating Aggregation_Count_History_table..."
+        $RM -rf ${ENIQ_ADMIN_DIR}/sql/insert_aggregation_count_History.sql
+        $TOUCH ${ENIQ_ADMIN_DIR}/sql/insert_aggregation_count_History.sql
+        SqlFile=${ENIQ_ADMIN_DIR}/sql/insert_aggregation_count_History.sql
+
+$SED -i 's/::/|/g' ${aggregated_file}; $SED -i 's/$/|/g' ${aggregated_file}
+$CAT > $SqlFile  <<STOP_SQL_CODE_POINT
+set temporary option ESCAPE_CHARACTER='ON';
+set temporary option ON_ERROR='EXIT';
+set temporary option "quoted_identifier" = 'On';
+LOCK TABLE dba.Aggregation_Count_History IN WRITE MODE WAIT '00:05:00';
+LOAD TABLE dba.Aggregation_Count_History ("db_object" NULL('NULL'),"counter_name" NULL('NULL'),"counter_count" NULL('NULL'),"access_date" DATE('YYYY-MM-DD') NULL('NULL'))
+from '${aggregated_file}'
+ESCAPES OFF
+QUOTES OFF
+DELIMITED BY '|'
+ROW DELIMITED BY '
+'
+WITH CHECKPOINT OFF ;
+STOP_SQL_CODE_POINT
+
+$SU - $SYSUSER >> /dev/null  -c "${IQDIR}/bin64/dbisql ${CONN_STR_USER_DBA} -q \"${SqlFile}\" " >/dev/null 2>>$LOGFILE
+if [ $? -ne 0 ];    then
+    $CAT ${COUNTER_TOOL_PARENT_DIR}/date_to_aggregate.txt > ${COUNTER_TOOL_PARENT_DIR}/.failed_aggregation_flag.txt
+    _err_msg_="Failed to update Aggregation_Count_History_table "
+     abort_script "$_err_msg_"
+fi
+$SED -i "/${date_to_find}/d" ${COUNTER_TOOL_PARENT_DIR}/date_to_aggregate.txt
+
+        # Clean up of parsed files on each blade on successfull aggregation
+        if [ "${CO_SERVER}" == "YES" ]; then
+            for _line_ in `$CAT ${TEM_DIR}/server_order_list`; do
+                _ip_address_=`$ECHO ${_line_} | $AWK -F"::" '{print $1}'`
+                _serv_hostname_=`$ECHO ${_line_} | $AWK -F"::" '{print $2}'`
+                _serv_name_=`$ECHO ${_line_} | $AWK -F"::" '{print $3}'`
+                if [ ! "${_ip_address_}" -o ! "${_serv_hostname_}" -o ! "${_serv_name_}" ]; then
+                    _err_msg_="Could not read required info from ${TEM_DIR}/server_order_list"
+                    abort_script "${_err_msg_}"
+                fi
+
+                if [ "${_ip_address_}" == "${HOST_IP}" ]; then
+                    $FIND ${COUNTER_TOOL_DIR}/files_to_parse_L1 -type f | $GREP ${date_to_find} | $XARGS $RM -rf
+                    $FIND ${COUNTER_TOOL_DIR}/files_to_parse_L2 -type f | $GREP ${date_to_find} | $XARGS $RM -rf
+                    $FIND ${COUNTER_TOOL_PARENT_DIR}/aggregated -type f | $GREP ${date_to_find} | $XARGS $RM -rf
+                elif [ "${_serv_name_}" == "stats_engine" ]; then
+                    continue
+                else
+                    if [ "${_serv_name_}" == "dwh_reader_1" ]; then
+                        DIR_NAME=${COUNTER_TOOL_PARENT_DIR}/RD1
+                    elif [ "${_serv_name_}" == "dwh_reader_2" ]; then
+                        DIR_NAME=${COUNTER_TOOL_PARENT_DIR}/RD2
+                    fi
+                    run_remote_cmd "${_ip_address_}" "$FIND ${DIR_NAME}/files_to_parse_L1 -type f | $GREP ${date_to_find} | $XARGS $RM -rf" "${LOGFILE}"
+                    run_remote_cmd "${_ip_address_}" "$FIND ${DIR_NAME}/files_to_parse_L2 -type f | $GREP ${date_to_find} | $XARGS $RM -rf" "${LOGFILE}"
+                fi
+            done
+        fi
+        $RM -rf ${TEM_DIR}/server_order_list
+    else
+        log_msg -l ${LOGFILE} -t -s "Aggregated file not found for - ${date_to_find}"
+
+    fi
+done
+
+log_msg -l ${LOGFILE} -t -s "Successfully updated Aggregation_Count_History_table"
+$RM -rf ${ENIQ_ADMIN_DIR}/sql/insert_aggregation_count_History.sql
+}
+
+### Function: update_dwhdb_conf_file ###
+#
+# Update dwhdb.conf file to enable RLL
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_dwhdb_conf_file()
+{
+$CP -pr ${DWH_CONF} ${DWH_CONF}_ctlorg
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not take backup of ${DWH_CONF} to ${DWH_CONF}_ctlorg"
+     abort_script "${_err_msg_}"
+fi
+#$SED -i 's/\#\-zr all/\-zr all/;s/\#\-zs 5G/\-zs 5G/;s/\#\-zo \/eniq\/log\/sw_log\/iq\/iqtracedwhdb.log/\-zo \"${RLL_LOG_FILE}\"/' ${TEM_DIR}/dwhdb.cfg
+$CAT ${DWH_CONF} | $GREP -v "zr\|zs\|zo" > ${TEM_DIR}/dwhdb.cfg
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not update ${TEM_DIR}/dwhdb.cfg file"
+     abort_script "${_err_msg_}"
+fi
+$ECHO "-zr all
+-zs 5G
+-zo ${RLL_LOG_FILE}" > ${TEM_DIR}/RLL_paramaters.txt
+$CAT ${TEM_DIR}/RLL_paramaters.txt >> ${TEM_DIR}/dwhdb.cfg
+if [ $? -ne 0 ]; then
+     _err_msg_="Could not update values in ${TEM_DIR}/dwhdb.cfg"
+     abort_script "${_err_msg_}"
+fi
+$CP -pr ${TEM_DIR}/dwhdb.cfg ${DWH_CONF}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/dwhdb.cfg to ${DWH_CONF}"
+    abort_script "${_err_msg_}"
+fi
+log_msg -l ${LOGFILE} -t -s "Updated parameters in ${DWH_CONF} file on ${HNAME}"
+}
+
+### Function: update_dwhdb_conf_file_disable ###
+#
+# Update dwhdb.conf file to disable RLL
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+update_dwhdb_conf_file_disable()
+{
+$CP -pr ${DWH_CONF} ${TEM_DIR}/dwhdb.cfg
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not take backup of ${DWH_CONF} to ${TEM_DIR}/dwhdb.cfg"
+    abort_script "${_err_msg_}"
+fi
+
+$SED -i "s/-zr/#-zr/g;s/-zs/#-zs/g;s/-zo/#-zo/g" ${TEM_DIR}/dwhdb.cfg
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not update values in ${TEM_DIR}/dwhdb.cfg"
+    abort_script "${_err_msg_}"
+fi
+$CP -pr ${TEM_DIR}/dwhdb.cfg ${DWH_CONF}
+if [ $? -ne 0 ]; then
+    _err_msg_="Could not copy ${TEM_DIR}/dwhdb.cfg to ${DWH_CONF}"
+    abort_script "${_err_msg_}"
+fi
+
+log_msg -l ${LOGFILE} -t -s "Updated parameters in ${DWH_CONF} file on ${HNAME}"
+}
+
+
+
+
+### Function: usage_msg ###
+#
+#   Print out the usage message
+#
+# Arguments:
+#   none
+# Return Values:
+#   none
+usage_msg()
+{
+clear
+$ECHO "
+Usage: /usr/bin/bash `$BASENAME $0` -a <data_collection|parse_levels|aggregation|disable_logging|cleanup>  [ -l <path_to_logfile> ]
+
+-a : action to perform for the stated user.
+        data_collection :                   Collect raw data using RLL
+        disable_logging :                   Disable Request Level Logging
+        parse_levels    :                   Parsing based on markers & Parsing based
+                                            on SELECT operations
+        aggregation     :                   Aggregates data per day along with the
+                                            count for the 
+                                            used and unused columns against a
+                                            particular database object
+        cleanup         :                   Clean temporary files after aggregation
+                                            and other log files based on retention
+                                            period
+
+-l  : Optional parameter specifying the full path to logfile. If not specified,
+      a logfile will be created in /eniq/log/sw_log/iq/
+"
+}
+
+# ********************************************************************
+#
+#   Main body of program
+#
+# ********************************************************************
+RUN_TIME=`$DATE '+%Y-%m-%d_%H:%M:%S'`
+green=`tput setaf 2`
+cyan=`tput setaf 6`
+yellow=`tput setaf 3`
+reset=`tput sgr0`
+
+while getopts "a:l:" arg; do
+  case $arg in
+    a) ACTION_TYPE="$OPTARG"
+       ;;
+    l) LOGFILE="$OPTARG"
+       ;;
+    \?) usage_msg
+       abort_script "$($DATE '+%Y-%m-%d_%H.%M.%S'): Unknown argument passed to script."
+       ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+
+
+#check params
+check_params
+
+# Determine absolute path to software
+check_absolute_path
+
+# Set up environment variables for script.
+setup_env
+
+# Determine counter directory
+check_bladewise_counter_dir
+
+log_msg -l ${LOGFILE} -s "\n********************* ${RUN_TIME} : Entering ${ACTION_TYPE} on ${HNAME} *********************\n"
+
+if [ "${ACTION_TYPE}" == "data_collection" ]; then
+    if [ "${CO_SERVER}" == "YES" ]; then
+        _dwhdb_service_name_="eniq-dwhdb"
+    elif [ "${RD_SERVER}" == "YES" ]; then
+        _dwhdb_service_name_="eniq-dwh_reader"
+    fi
+    if [ ! -f ${COUNTER_TOOL_PARENT_DIR}/.rll_enabled_flag ]; then
+        while :; do
+
+            _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+            if [ "${_dwhdbstate_}" == "active" ]; then
+                $ECHO -e "\nThis would require restart of the Database Service. Do you wish to proceed? (Yes|No)\n"
+                read input
+            else
+                input="Yes"
+            fi
+            
+            if [ "${input}" == "Yes" -o "${input}" == "yes" ];then
+                create_log_directories
+                create_config_file
+            
+                # get bladewise config and RLL log files
+                get_config_log_files
+            
+                enable_request_level_logging
+            
+                # add cron entry for all levels
+                add_cron_entry
+                break
+            
+            elif [ "${input}" == "No" -o "${input}" == "no" ]; then
+                log_msg -l ${LOGFILE} -t -s "Not Enabling Counter Tool. Exiting..."
+                break
+            else
+                continue
+            fi
+        done
+    else
+           log_msg -l ${LOGFILE} -t -s "Skipping as Request Level Logging is already enabled."
+    fi
+elif [ "${ACTION_TYPE}" == "parse_levels" ]; then
+    parsing_level_1
+    parsing_level_2
+    $ECHO "\n${green}Please find the log file: ${LOGFILE}${reset}"
+elif [ "${ACTION_TYPE}" == "aggregation" ]; then
+    parsing_level_3
+elif [ "${ACTION_TYPE}" == "cleanup" ]; then
+    cleanup
+elif [ "${ACTION_TYPE}" == "disable_logging" ]; then
+    if [ "${CO_SERVER}" == "YES" ]; then
+        _dwhdb_service_name_="eniq-dwhdb"
+    elif [ "${RD_SERVER}" == "YES" ]; then
+        _dwhdb_service_name_="eniq-dwh_reader"
+    fi
+    
+    if [ -f ${COUNTER_TOOL_PARENT_DIR}/.rll_enabled_flag ]; then
+        while :; do
+            _dwhdbstate_=`$SYSTEMCTL show -p ActiveState ${_dwhdb_service_name_} |$CUT -d= -f2`
+            if [ "${_dwhdbstate_}" == "active" ]; then
+                $ECHO -e "\nThis would require restart of the Database Service. Do you wish to proceed? (Yes|No)\n"
+                read _input_
+            else
+                    _input_="Yes"
+            fi
+            
+            if [ "${_input_}" == "Yes" -o "${_input_}" == "yes" ];then
+                # get bladewise config and RLL log files
+                get_config_log_files
+                $RM -rf ${COUNTER_TOOL_CONFIG_FILE}
+                disable_request_level_logging
+                
+                # remove master cron entry
+                remove_cron_entry
+                    break
+            elif [ "${_input_}" == "No" -o "${_input_}" == "no" ];then
+                log_msg -l ${LOGFILE} -t -s "Not Disabling Counter Tool. Exiting..."
+                    break
+            else
+                continue
+            fi
+        done
+    else
+        log_msg -l ${LOGFILE} -t -s "Skipping as Request Level Logging is already disabled."
+    fi
+fi 
+
+log_msg -l ${LOGFILE} -s "\n********************* $($DATE '+%Y-%m-%d_%H:%M:%S') : Successfully completed ${ACTION_TYPE} *********************\n"
+
+$RM -rf ${TEM_DIR}
+exit 0

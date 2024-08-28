@@ -1,0 +1,6 @@
+PKGINST=counter_statistics_tool.tar.gz
+NAME=Counter Statistics Tool tar file
+ARCH=i386
+VERSION=R1A08
+PRODNUM=CXP9039443
+
